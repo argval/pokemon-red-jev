@@ -88,10 +88,10 @@ uv run pokemon-red-jev prepare-data --pokered vendor/pokered
 
 ```sh
 codex login status
-# Add TYPESAFE_API_KEY to .env, then start a fresh game:
-uv run pokemon-red-jev run --planner codex --steps 1000
+# Add TYPESAFE_API_KEY to .env, then start a fresh game (runs until done or interrupted):
+uv run pokemon-red-jev run --planner codex
 # Or resume from the verified opening checkpoint:
-uv run pokemon-red-jev run --planner codex --resume saves/rom-check.zip --steps 1000
+uv run pokemon-red-jev run --planner codex --resume saves/rom-check.zip
 ```
 
 This uses your ChatGPT sign-in for goal planning and the separate TypeSafe key for Jev's action choices. A Codex process starts only when the active short-term goal finishes, stalls, or expires; Jev handles the intervening actions. CLI startup and model inference pause game emulation, so goal changes can take several seconds. Check your Codex plan's usage limits for sustained runs.
@@ -100,7 +100,7 @@ To check Codex planning before adding a TypeSafe key, run `uv run pokemon-red-je
 
 The existing baselines remain available: `--planner off` needs only Jev's TypeSafe key, while `--planner llm` uses the OpenRouter-compatible fields in `.env`. The default controller is Jev and its default planner is `llm`; pass `--planner codex` explicitly. `--speed 1` runs emulator frames at real-time speed; `0` removes that limit.
 
-`--steps` counts control-loop iterations, including animation waits and menus. Each task has a separate budget counting overworld decisions. Saves occur every 60 seconds between actions and at shutdown. A checkpoint stores emulator state and agent memory in one atomic archive. On resume, the planner receives fresh state and replaces the old active task. Use distinct `--save` and `--log` paths for separate experiments.
+`--steps` counts control-loop iterations, including animation waits and menus. The default is `0`, which runs indefinitely until the story is complete, Escape, or Ctrl-C. Pass a positive value for a bounded session (for example `--steps 1000`). Each task has a separate budget counting overworld decisions. Saves occur every 60 seconds between actions and at shutdown. A checkpoint stores emulator state and agent memory in one atomic archive. On resume, the planner receives fresh state and replaces the old active task. Use distinct `--save` and `--log` paths for separate experiments.
 
 ### Repeat the ROM check
 

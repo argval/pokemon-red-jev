@@ -94,7 +94,8 @@ def main():
     run.add_argument("--data", type=Path)
     run.add_argument("--headless", action="store_true")
     run.add_argument("--speed", type=int, default=1, help="Emulator speed multiplier; 0 = unlimited")
-    run.add_argument("--steps", type=int, default=1000, help="Control-loop iterations, including menus and animations")
+    run.add_argument("--steps", type=int, default=0,
+                     help="Control-loop iterations, including menus and animations; 0 = run until done or interrupted")
     run.add_argument("--controller", choices=["jev", "manual"], default="jev")
     run.add_argument("--planner", choices=["codex", "llm", "off"], help="Default: llm for Jev, off for manual control")
     run.add_argument("--resume", type=Path)
@@ -134,8 +135,8 @@ def main():
             finally:
                 log.close()
             return
-        if args.steps < 1 or args.speed < 0:
-            parser.error("--steps must be positive and --speed must be nonnegative")
+        if args.command == "run" and (args.steps < 0 or args.speed < 0):
+            parser.error("--steps and --speed must be nonnegative; --steps 0 runs indefinitely")
         rom = args.rom or (Path(os.environ["ROM_PATH"]) if os.getenv("ROM_PATH") else None)
         if rom is None or not rom.is_file():
             raise ValueError("Set ROM_PATH in .env or pass --rom. Use `demo` without a ROM.")
@@ -160,8 +161,11 @@ def main():
                 game.tick()  # Present the restored frame in the native window.
             last_save = time.monotonic()
             errors = 0
+            remaining = None if args.steps == 0 else args.steps
+            if remaining is None:
+                print("Running indefinitely until story complete, Escape, or Ctrl-C.", flush=True)
             try:
-                for _ in range(args.steps):
+                while remaining is None or remaining > 0:
                     try:
                         agent.step()
                         errors = 0
@@ -173,6 +177,8 @@ def main():
                         if errors >= 3:
                             raise ModelError("Three consecutive Jev failures; stopped and saved") from exc
                         time.sleep(1)
+                    if remaining is not None:
+                        remaining -= 1
                     if time.monotonic() - last_save >= 60:
                         agent.save(args.save)
                         last_save = time.monotonic()

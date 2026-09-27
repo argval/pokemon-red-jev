@@ -76,7 +76,8 @@ def overlay_lines(state, controller, width):
         species = mon.get("species") or "?"
         nickname = mon.get("nickname") or ""
         label = f"{species} ({nickname})" if nickname and nickname != species else species
-        stats = f"Lv{str(mon.get('level', 0)).ljust(3)}{str(mon.get('hp', 0)).rjust(3)}/{str(mon.get('max_hp', 0)).ljust(3)}"
+        mark = {"POISON": "PSN", "BURN": "BRN", "SLEEP": "SLP", "FREEZE": "FRZ", "PARALYZED": "PAR"}.get(mon.get("status") or "", "")
+        stats = f"Lv{str(mon.get('level', 0)).ljust(3)}{str(mon.get('hp', 0)).rjust(3)}/{str(mon.get('max_hp', 0)).ljust(3)}{(' ' + mark) if mark else ''}"
         room = max(10, width - len(stats) - 1)
         party_lines.append(f"{label[:room].ljust(room)} {stats}")
     where = str(state.get("map", "")).replace("_", " ")

@@ -8,7 +8,7 @@ import time
 
 from .agent import Agent
 from .data import Data, generate
-from .models import CodexPlanner, Jev, ModelError, Planner
+from .models import CodexPlanner, CursorPlanner, Jev, ModelError, Planner, cursor_agent_binary
 
 
 def load_env(path=Path(".env")):
@@ -97,7 +97,8 @@ def main():
     run.add_argument("--steps", type=int, default=0,
                      help="Control-loop iterations, including menus and animations; 0 = run until done or interrupted")
     run.add_argument("--controller", choices=["jev", "manual"], default="jev")
-    run.add_argument("--planner", choices=["codex", "llm", "off"], help="Default: llm for Jev, off for manual control")
+    run.add_argument("--planner", choices=["codex", "cursor", "llm", "off"],
+                     help="Default: llm for Jev, off for manual control")
     run.add_argument("--resume", type=Path)
     run.add_argument("--save", type=Path, default=Path("saves/latest.zip"))
     run.add_argument("--log", type=Path, default=Path("logs/run.jsonl"))
@@ -117,6 +118,9 @@ def main():
                 print(f"{key}: {'present' if present else 'missing / placeholder'}{suffix}")
             from shutil import which
             print(f"Codex CLI: {'installed' if which('codex') else 'missing'}")
+            cursor = cursor_agent_binary()
+            print(f"Cursor Agent CLI: {'installed (' + Path(cursor).name + ')' if cursor else 'missing'}; "
+                  f"check `agent status` for login")
             if checks["ROM_PATH"] and checks["GAME_DATA_PATH"]:
                 from .game import Rom
                 Rom(Path(os.environ["ROM_PATH"]), Data(Path(os.getenv("GAME_DATA_PATH", "data/generated.json"))))
@@ -148,6 +152,7 @@ def main():
             jev = Manual() if args.controller == "manual" else Jev(log)
             planner_mode = args.planner or ("off" if args.controller == "manual" else "llm")
             planner = (CodexPlanner(log) if planner_mode == "codex" else
+                       CursorPlanner(log) if planner_mode == "cursor" else
                        Planner(log) if planner_mode == "llm" else None)
             print(f"Controller: {args.controller}; planner: {planner_mode}" +
                   ("" if args.headless else "; window: game and Jev panel"))

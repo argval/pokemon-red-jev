@@ -85,6 +85,38 @@ def story():
     return json.loads(files(__package__).joinpath("story.json").read_text())
 
 
+# The next story battle's defending types. Counters come from the type chart, not a fixed team.
+GYM_DEFENDERS = {
+    "brock": ("Brock", ("ROCK", "GROUND")),
+    "misty": ("Misty", ("WATER",)),
+    "surge": ("Lt. Surge", ("ELECTRIC",)),
+    "erika": ("Erika", ("GRASS",)),
+    "koga": ("Koga", ("POISON",)),
+    "sabrina": ("Sabrina", ("PSYCHIC",)),
+    "blaine": ("Blaine", ("FIRE",)),
+    "giovanni": ("Giovanni", ("GROUND",)),
+    "lorelei": ("Lorelei", ("ICE", "WATER")),
+    "bruno": ("Bruno", ("FIGHTING", "ROCK")),
+    "agatha": ("Agatha", ("GHOST", "POISON")),
+    "lance": ("Lance", ("DRAGON", "FLYING")),
+}
+
+
+def next_gym(state):
+    """The next gym or Elite Four fight from the current story milestone."""
+    current = (state.get("milestone") or {}).get("id")
+    if not current:
+        return None
+    ids = [milestone["id"] for milestone in story()]
+    if current not in ids:
+        return None
+    for milestone_id in ids[ids.index(current):]:
+        if milestone_id in GYM_DEFENDERS:
+            leader, types = GYM_DEFENDERS[milestone_id]
+            return {"id": milestone_id, "leader": leader, "types": types}
+    return None
+
+
 def current_milestone(state):
     m = next((m for m in story() if not complete(m["success"], state)), None)
     if m is None:

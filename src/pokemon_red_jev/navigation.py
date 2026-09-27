@@ -137,6 +137,13 @@ HEAL_ITEM = re.compile(
     r"POTION|FRESH WATER|SODA POP|LEMONADE|FULL RESTORE|REVIVE|ANTIDOTE|PARLYZ HEAL|AWAKENING|BURN HEAL|ICE HEAL|FULL HEAL")
 
 
+def scripted_rival_exit(state):
+    """True when Oak's lab rival battle is waiting on the exit, not on talking to him."""
+    return (state.get("map") == "OAKS_LAB"
+            and bool(state.get("party"))
+            and "EVENT_BATTLED_RIVAL_IN_OAKS_LAB" not in set(state.get("events") or ()))
+
+
 class RouteMemory:
     """Exits that failed, and bag items opened without effect. Reset when badges, story, or items change."""
 
@@ -317,7 +324,10 @@ def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, sto
         if taught is not None:
             desc = taught
         elif HEAL_ITEM.search(name):
-            desc = f"Use on a Pokémon to heal or cure. {qty} left." if injured or ailment or "REVIVE" in name else ""
+            hurt = [f"{p.get('nickname') or p.get('species')} is {str(p.get('status')).lower()}"
+                    for p in party if p.get("status") not in (None, "OK")]
+            who = f" {'; '.join(hurt)}." if hurt else ""
+            desc = f"Use on a Pokémon to heal or cure.{who} {qty} left." if injured or ailment or "REVIVE" in name else ""
         elif name.endswith("STONE"):
             desc = stone_text(name, party) if stone_text else ""
         elif "REPEL" in name:
@@ -686,6 +696,7 @@ class Navigation:
         if needed:
             state["field_move_needed"] = needed
         layers = self.regions.mansion_distances(objective, self.memory.skip()) if md["name"].startswith("POKEMON_MANSION_") else None
+        rival_exit = scripted_rival_exit(state)
         result = []
 
         def edges_of(regions):
@@ -706,7 +717,9 @@ class Navigation:
             landing = set().union(*(self.regions.landing(r) for r in regions)) if regions else set()
             distance = self._areas(landing, objective) if landing else None
             text = f"Destination {', '.join(names) or 'unknown'}. Areas to goal: {distance if distance is not None else 'no known route'}."
-            if distance is not None and here_hops is not None and distance < here_hops:
+            if rival_exit:
+                text += " Leads toward the objective: walking out starts the rival battle."
+            elif distance is not None and here_hops is not None and distance < here_hops:
                 text += " Leads toward the objective."
             elif distance is None and needed:
                 text += f" No walking route until {needed} is available."
@@ -735,7 +748,10 @@ class Navigation:
                     point = destination[live_warp["warp"]]
                     region = self.regions.at(live_warp["map"], point["x"], point["y"])
                     targets = {region} if region is not None else set()
-            add(f"door:{i}", f"Use door/stairs at {pos}. {route(targets)}", "door", path, edges_of(targets), **warp)
+            door = f"Use door/stairs at {pos}. {route(targets)}"
+            if rival_exit:
+                door += " Talking to him does not start the fight."
+            add(f"door:{i}", door, "door", path, edges_of(targets), **warp)
         for con in md["connections"]:
             direction = con["direction"]
             edge = {"up": lambda x, y: y < 0, "down": lambda x, y: y >= grid.h,
@@ -784,6 +800,10 @@ class Navigation:
                 name = g.data.sprites.get(target.get("picture"), "sign")
                 obj = next((o for o in md["objects"] if o["index"] == target.get("index")), {})
                 key = f"{kind}:{target.get('index', i)}"
+                # The lab rival is a door script. Talking to him loops without starting the battle.
+                if (rival_exit and kind == "npc"
+                        and (obj.get("trainer_class") == "RIVAL1" or name == "BLUE")):
+                    continue
                 said = self.memory.talk_fact(state["map"], key, kind)
                 if kind == "sign" and state["map"] == "CELADON_MART_ROOF" and y <= 2 and 10 <= x <= 12:
                     facts = f"A drink vending machine (FRESH WATER ¥200, SODA POP ¥300, LEMONADE ¥350).{said}"

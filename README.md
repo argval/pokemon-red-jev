@@ -52,9 +52,11 @@ LLM_MODEL=
 
 Jev uses TypeSafe's direct HTTP API. `TYPESAFE_API_KEY` is a TypeSafe key; the original project's Vercel gateway key is not interchangeable. For `--planner codex`, run `codex login` once with your ChatGPT account, then check `codex login status`. The app starts a fresh, read-only `codex exec` in a temporary directory for each new short-term goal. It validates Codex's structured response against known game identifiers before Jev sees it. [OpenAI Docs](https://learn.chatgpt.com/docs/non-interactive-mode) confirms that `codex exec` reuses saved CLI authentication and supports a JSON output schema.
 
-The previous OpenRouter-compatible planner remains available with `--planner llm`. It requires `LLM_API_KEY` and `LLM_MODEL`; Codex mode does not use them. Cursor has its own signed-in CLI, but this project currently implements the Codex CLI bridge only.
+For `--planner cursor`, install the Cursor Agent CLI (`agent` or `cursor-agent`), run `agent login` once, then check `agent status`. The app starts a fresh ask-mode `agent -p` in an empty temporary workspace for each new short-term goal (so repo rules and skills are not loaded into the prompt). It does not use OpenRouter keys. Set `CURSOR_MODEL` (default `composer-2.5`) and `CURSOR_TIMEOUT_SECONDS` in `.env` if needed.
 
-Codex and HTTP request timeouts, plus Jev's rate limits, are configurable in `.env.example`. HTTP requests have one bounded retry. Jev and the HTTP planner require their respective credentials; manual control with Codex planning needs only the Codex sign-in. An invalid or failed planner response installs a temporary story goal and retries planning after its budget expires. Repeated Jev failures stop the run and save progress.
+The previous OpenRouter-compatible planner remains available with `--planner llm`. It requires `LLM_API_KEY` and `LLM_MODEL`; Codex and Cursor modes do not use them.
+
+Codex, Cursor, and HTTP request timeouts, plus Jev's rate limits, are configurable in `.env.example`. HTTP requests have one bounded retry. Jev and the HTTP planner require their respective credentials; manual control with Codex or Cursor planning needs only the matching CLI sign-in. An invalid or failed planner response installs a temporary story goal and retries planning after its budget expires. Repeated Jev failures stop the run and save progress.
 
 ### Generate game symbols
 
@@ -84,7 +86,7 @@ The current checkout includes ignored, generated data built from `pret/pokered` 
 uv run pokemon-red-jev prepare-data --pokered vendor/pokered
 ```
 
-### Run Jev with Codex goals
+### Run Jev with Codex or Cursor goals
 
 ```sh
 codex login status
@@ -92,13 +94,17 @@ codex login status
 uv run pokemon-red-jev run --planner codex
 # Or resume from the verified opening checkpoint:
 uv run pokemon-red-jev run --planner codex --resume saves/rom-check.zip
+
+# Same loop with Cursor Agent as the goal planner (uses `agent login`):
+agent status
+uv run pokemon-red-jev run --planner cursor --resume saves/rom-check.zip
 ```
 
-This uses your ChatGPT sign-in for goal planning and the separate TypeSafe key for Jev's action choices. A Codex process starts only when the active short-term goal finishes, stalls, or expires; Jev handles the intervening actions. CLI startup and model inference pause game emulation, so goal changes can take several seconds. Check your Codex plan's usage limits for sustained runs.
+This uses your ChatGPT or Cursor sign-in for goal planning and the separate TypeSafe key for Jev's action choices. A planner process starts only when the active short-term goal finishes, stalls, or expires; Jev handles the intervening actions. CLI startup and model inference pause game emulation, so goal changes can take several seconds. Check your plan's usage limits for sustained runs.
 
-To check Codex planning before adding a TypeSafe key, run `uv run pokemon-red-jev run --controller manual --planner codex --resume saves/rom-check.zip`. You choose actions in the terminal while Codex proposes goals.
+To check planning before adding a TypeSafe key, run `uv run pokemon-red-jev run --controller manual --planner cursor --resume saves/rom-check.zip` (or `--planner codex`). You choose actions in the terminal while the planner proposes goals.
 
-The existing baselines remain available: `--planner off` needs only Jev's TypeSafe key, while `--planner llm` uses the OpenRouter-compatible fields in `.env`. The default controller is Jev and its default planner is `llm`; pass `--planner codex` explicitly. `--speed 1` runs emulator frames at real-time speed; `0` removes that limit.
+The existing baselines remain available: `--planner off` needs only Jev's TypeSafe key, while `--planner llm` uses the OpenRouter-compatible fields in `.env`. The default controller is Jev and its default planner is `llm`; pass `--planner codex` or `--planner cursor` explicitly. `--speed 1` runs emulator frames at real-time speed; `0` removes that limit.
 
 `--steps` counts control-loop iterations, including animation waits and menus. The default is `0`, which runs indefinitely until the story is complete, Escape, or Ctrl-C. Pass a positive value for a bounded session (for example `--steps 1000`). Each task has a separate budget counting overworld decisions. Saves occur every 60 seconds between actions and at shutdown. A checkpoint stores emulator state and agent memory in one atomic archive. On resume, the planner receives fresh state and replaces the old active task. Use distinct `--save` and `--log` paths for separate experiments.
 

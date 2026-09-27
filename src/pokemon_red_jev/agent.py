@@ -35,6 +35,11 @@ def alternate(choice, options, failures, location, probabilities):
     return alternatives[-1][0]
 
 
+# The story fallback keeps the player walking. Ask the planner only when that walk is not enough.
+PLAN_REASONS = {"startup", "stalled", "decision budget exhausted", "party health changed",
+                "repeated team losses", "checkpoint restored"}
+
+
 class Agent:
     def __init__(self, game, planner, jev, navigation, controls, log):
         self.game, self.planner, self.jev = game, planner, jev
@@ -165,6 +170,53 @@ class Agent:
                                 [f"{state['map']}:sign:{i}" for i, _ in enumerate(self.game.rom.maps[state["map_id"]]["signs"])] +
                                 [f"{state['map']}:hidden:{i}" for i, _ in enumerate(self.game.rom.hidden.get(state["map_id"], []))]}
 
+    def planner_brief(self, state):
+        """The facts a short-term goal needs. The screen, the full event list, and move ids are not among them."""
+        party = []
+        for mon in state.get("party") or []:
+            party.append({"species": mon.get("species"), "nickname": mon.get("nickname"), "level": mon.get("level"),
+                          "hp": mon.get("hp"), "max_hp": mon.get("max_hp"), "status": mon.get("status"),
+                          "types": mon.get("types"), "moves": [move.get("name") for move in mon.get("moves") or []]})
+        milestone = state.get("milestone") or {}
+        kept = {key: milestone.get(key) for key in ("id", "goal", "maps", "success", "missing_need") if key in milestone}
+        brief = {"map": state.get("map"), "x": state.get("x"), "y": state.get("y"), "badges": state.get("badges"),
+                 "money": state.get("money"), "party": party, "bag": state.get("bag"), "milestone": kept,
+                 "nearby_maps": state.get("map_distances") or {}, "visited": state.get("visited"),
+                 "recent_actions": state.get("recent_actions")}
+        if state.get("field_move_needed"):
+            brief["field_move_needed"] = state["field_move_needed"]
+        if state.get("recovery"):
+            brief["recovery"] = state["recovery"]
+        return brief
+
+    def planner_catalog(self, state):
+        """Identifiers the planner may use: nearby maps, the story step's maps, and its success event."""
+        full = self.catalog(state)
+        milestone = state.get("milestone") or {}
+        maps = set(state.get("map_distances") or {})
+        maps.update(milestone.get("maps") or [])
+        need = milestone.get("missing_need") or {}
+        if need.get("map"):
+            maps.add(need["map"])
+        maps.add(state["map"])
+
+        def events_in(condition, found):
+            if not isinstance(condition, dict):
+                return
+            if condition.get("kind") in {"all", "any"}:
+                for child in condition.get("value") or []:
+                    events_in(child, found)
+            elif condition.get("kind") == "event" and condition.get("value") in full["events"]:
+                found.add(condition["value"])
+
+        events = set()
+        events_in(milestone.get("success"), events)
+        items = {item["name"] for item in state.get("bag") or []}
+        items.update(need.get("items") or [])
+        return {"maps": sorted(maps), "events": sorted(events),
+                "items": sorted(item for item in items if item in full["items"]),
+                "interactions": full["interactions"]}
+
     def finish_goal(self, reason):
         self.previous = {"goal": self.goal.to_dict(), "outcome": reason, "decisions": self.goal_decisions}
         self.log("goal_end", **self.previous)
@@ -251,15 +303,16 @@ class Agent:
         if self.goal is None and state["mode"] == "overworld":
             state.pop("active_goal", None)
             self._show(state)
-            if self.planner is not None:
+            walking = fallback_goal(state)
+            if self.planner is not None and self.replan_reason in PLAN_REASONS:
                 self.plans += 1
                 try:
-                    self.goal = self.planner.plan(state, self.catalog(state), self.previous)
+                    self.goal = self.planner.plan(self.planner_brief(state), self.planner_catalog(state), self.previous)
                 except ModelError as exc:
                     self.log("planner_error", error=str(exc), fallback="temporary story goal")
-                    self.goal = fallback_goal(state)
+                    self.goal = walking
             else:
-                self.goal = fallback_goal(state)
+                self.goal = walking
             if recovering and self.goal.focus == "progress":
                 self.goal = self._recovery_goal(state)
             self.goal_decisions = self.no_progress = 0

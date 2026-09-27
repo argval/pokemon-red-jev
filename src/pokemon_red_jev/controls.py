@@ -2,6 +2,7 @@
 
 import re
 
+from .goals import next_gym
 from .navigation import Action
 
 PHYSICAL = {"NORMAL", "FIGHTING", "FLYING", "POISON", "GROUND", "ROCK", "BUG", "GHOST"}
@@ -39,6 +40,142 @@ def hit_chance(accuracy, accuracy_stage, evasion_stage):
     attack_n, attack_d = STAGE[accuracy_stage - 1]
     evade_n, evade_d = STAGE[13 - evasion_stage]
     return max(1, min(100, round(accuracy * (attack_n / attack_d) * (evade_n / evade_d))))
+
+
+def escape_chance(player_speed, enemy_speed, attempts=0):
+    """Chance the next Run succeeds. `attempts` is how many tries have already failed.
+
+    The game escapes for certain when the player's speed is at least the enemy's.
+    Otherwise it scores (player speed * 32) / (enemy speed / 4), then adds 30 for each
+    earlier failed try. The first try does not get that bonus. A roll of 0–255 succeeds
+    when it is less than or equal to that score.
+    """
+    if player_speed >= enemy_speed:
+        return 1
+    divisor = (enemy_speed // 4) & 0xFF
+    if divisor == 0:
+        return 1
+    score = (player_speed * 32) // divisor
+    if score > 255:
+        return 1
+    score += 30 * attempts
+    if score > 255:
+        return 1
+    return (score + 1) / 256
+
+
+# Move effect ids from pret/pokered constants/move_effect_constants.asm.
+EFFECTS = {
+    0x02: "May poison.", 0x03: "Drains some of the damage as HP.", 0x04: "May burn.",
+    0x05: "May freeze.", 0x06: "May paralyze.", 0x07: "The user faints.",
+    0x08: "Hits only a sleeping target and drains HP.", 0x09: "Copies the last move used on the user.",
+    0x0A: "Raises the user's Attack.", 0x0B: "Raises the user's Defense.", 0x0C: "Raises the user's Speed.",
+    0x0D: "Raises the user's Special.", 0x0E: "Raises the user's accuracy.", 0x0F: "Raises the user's evasion.",
+    0x10: "Scatters coins.", 0x11: "Never misses.", 0x12: "Lowers the target's Attack.",
+    0x13: "Lowers the target's Defense.", 0x14: "Lowers the target's Speed.", 0x15: "Lowers the target's Special.",
+    0x16: "Lowers the target's accuracy.", 0x17: "Lowers the target's evasion.",
+    0x18: "User becomes the type of one of its moves.", 0x19: "Resets every stat change.",
+    0x1A: "Waits 2–3 turns, then returns twice the damage taken.",
+    0x1B: "Attacks for 2–3 turns, then confuses the user.",
+    0x1C: "Ends a wild battle. Against a trainer, it switches their Pokémon.",
+    0x1D: "Hits 2–5 times. A damage estimate is for one hit.", 0x1F: "May cause flinching.",
+    0x20: "Puts the target to sleep.", 0x21: "May poison.", 0x22: "May burn.", 0x24: "May paralyze.",
+    0x25: "May cause flinching.", 0x26: "One-hit KO. Fails against a faster target. Low accuracy.",
+    0x27: "Charges on the first turn, then hits.", 0x28: "Removes half the target's remaining HP.",
+    0x29: "Deals fixed or level-based damage.", 0x2A: "Traps the target for 2–5 turns so it cannot run or switch.",
+    0x2B: "Vanishes for a turn, then hits.", 0x2C: "Hits twice. A damage estimate is for one hit.",
+    0x2D: "If it misses, the user is hurt.", 0x2E: "Blocks stat drops while it lasts.",
+    0x2F: "Lowers the user's critical-hit rate in this game.", 0x30: "The user takes recoil.",
+    0x31: "Confuses the target.", 0x32: "Sharply raises the user's Attack.", 0x33: "Sharply raises the user's Defense.",
+    0x34: "Sharply raises the user's Speed.", 0x35: "Sharply raises the user's Special.",
+    0x36: "Sharply raises the user's accuracy.", 0x37: "Sharply raises the user's evasion.",
+    0x38: "Restores HP.", 0x39: "Copies the target's species, stats, and moves.",
+    0x3A: "Sharply lowers the target's Attack.", 0x3B: "Sharply lowers the target's Defense.",
+    0x3C: "Sharply lowers the target's Speed.", 0x3D: "Sharply lowers the target's Special.",
+    0x3E: "Sharply lowers the target's accuracy.", 0x3F: "Sharply lowers the target's evasion.",
+    0x40: "Halves special damage against the user for a while.",
+    0x41: "Halves physical damage against the user for a while.",
+    0x42: "Poisons the target.", 0x43: "Paralyzes the target.",
+    0x44: "May lower the target's Attack.", 0x45: "May lower the target's Defense.",
+    0x46: "May lower the target's Speed.", 0x47: "May lower the target's Special.",
+    0x4C: "May confuse.", 0x4D: "Hits twice and may poison. A damage estimate is for one hit.",
+    0x4F: "Spends a quarter of max HP to put up a substitute.",
+    0x50: "The user recharges next turn if it hits.",
+    0x51: "Attack rises when hit, and the user keeps using it.",
+    0x52: "Copies one of the target's moves until switched out.", 0x53: "Uses a random move.",
+    0x54: "Saps HP from the target each turn.", 0x55: "Does nothing.",
+    0x56: "Disables one of the target's moves for a while.",
+}
+NAMED_EFFECTS = {
+    "SEISMIC TOSS": "Damage equals the user's level.", "NIGHT SHADE": "Damage equals the user's level.",
+    "SONIC BOOM": "Deals 20 HP.", "DRAGON RAGE": "Deals 40 HP.",
+    "SUPER FANG": "Removes half the target's remaining HP.",
+    "PSYWAVE": "Random damage, up to 1.5 times the user's level.",
+    "REST": "Fully heals, then falls asleep.", "RECOVER": "Restores half of max HP.",
+    "SOFTBOILED": "Restores half of max HP.",
+    "QUICK ATTACK": "Usually strikes before a normal move.",
+    "COUNTER": "Usually strikes last. Returns twice the NORMAL or FIGHTING damage taken this turn.",
+}
+
+
+def describe_effect(move):
+    """What a move does beyond its printed power, in words a battle choice can use."""
+    named = NAMED_EFFECTS.get(move.get("name"))
+    if named:
+        return named
+    return EFFECTS.get(move.get("effect"), "")
+
+
+STATUS_NOTE = {
+    "BURN": "burned: it loses HP every turn, and its physical attacks are weaker.",
+    "POISON": "poisoned: it loses HP every turn, and also while you walk.",
+    "PARALYZED": "paralyzed: it is slower and may be unable to move.",
+    "SLEEP": "asleep: it cannot move until it wakes.",
+    "FREEZE": "frozen: it cannot move until it thaws.",
+}
+
+
+def status_note(name):
+    """What a non-OK status is doing. Empty when the Pokémon is fine."""
+    return STATUS_NOTE.get(name or "OK", "")
+
+
+def attack_types(party):
+    """Types the team can attack with, from species and from moves."""
+    found = []
+    for mon in party:
+        found.extend(mon.get("types") or [])
+        found.extend(move.get("type") for move in mon.get("moves") or [] if move.get("type"))
+    return found
+
+
+def gym_match(attack_types, defense_types, effectiveness):
+    """Which of these attack types the type chart calls strong or resisted."""
+    strong, resisted = [], []
+    for typing in dict.fromkeys(attack_types):
+        score = effectiveness(typing, defense_types)
+        if score > 1:
+            strong.append(typing)
+        elif score < 1:
+            resisted.append(typing)
+    return strong, resisted
+
+
+def gym_sentence(state, attack_types, effectiveness, subject):
+    """How these types line up with the next gym. Empty before the story has a gym."""
+    gym = next_gym(state)
+    if not gym:
+        return ""
+    leader, defense = gym["leader"], gym["types"]
+    shown = "/".join(defense)
+    if not attack_types or effectiveness is None:
+        return f"Next gym is {leader} ({shown})."
+    strong, resisted = gym_match(attack_types, defense, effectiveness)
+    if strong:
+        return f"{subject} is strong into the next gym, {leader} ({shown}), via {', '.join(strong)}."
+    if resisted:
+        return f"{subject} is resisted by the next gym, {leader} ({shown})."
+    return f"{subject} is neutral into the next gym, {leader} ({shown})."
 
 
 def shop_note(rows, label, bag):
@@ -327,7 +464,13 @@ class Controls:
             return [Action("advance", "Advance dialogue or wait for the animation.", "button", target={"button": "a"})]
         actions = []
         for i, (label, index) in enumerate(self.options()):
+            if label == "OPTION" and "NEW GAME" in rows:
+                continue
             facts = label
+            if label == "NEW GAME":
+                facts = "Start a new game."
+            elif label == "CONTINUE":
+                facts = "Continue the saved game."
             pokemon = next((p for p in state["party"] if p["nickname"] == label), None)
             if pokemon:
                 if state["mode"] == "battle" and pokemon["hp"] == 0:
@@ -371,7 +514,8 @@ class Controls:
                 facts += ". " + extra
             actions.append(Action(f"menu:{i}", facts, "menu", target={"label": label, "index": index}))
         forced_party = state["mode"] == "battle" and state["battle"]["player"]["hp"] == 0
-        if not forced_party:
+        # B on the title menu returns to the intro and resets text speed and battle animations.
+        if not forced_party and "NEW GAME" not in rows:
             actions.append(Action("cancel", "Press B to close or back out of this menu.", "button", target={"button": "b"}))
         if any("▼" in row or "<CONT>" in row for row in screen["rows"][:12]):
             actions.append(Action("scroll", "Scroll down to more list entries.", "button", target={"button": "down"}))
@@ -428,14 +572,23 @@ class Controls:
                 desc += " Status move (no direct damage)."
                 if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
                     desc += " Already in effect: using it again does nothing."
+            does = move.get("does") or describe_effect(move)
+            if does and move["name"] not in special:
+                desc += " " + does
             options.append(Action(f"move:{move['slot']}", desc, "battle_move", target=move))
         for p in state["party"]:
             if p["hp"] and p["slot"] != b["active_slot"]:
                 attacks = [m for m in p["moves"] if m["power"] and m["pp"]]
                 best = max((self.game.rom.effectiveness(m["type"], b["enemy"]["types"]) for m in attacks), default=None)
                 threat = max((self.game.rom.effectiveness(t, p["types"]) for t in b["enemy"]["types"]), default=1)
-                offense = f"Best usable damaging move type multiplier {best} against the enemy." if best is not None else "No damaging moves with PP remaining."
-                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, {'/'.join(p['types'])}, HP {p['hp']}/{p['max_hp']}). {offense} Enemy type attacks have a maximum type multiplier of {threat} against it. Uses a turn.", "switch", target=p))
+                listed = self._bench_moves(p, b["enemy"])
+                offense = listed or (f"Best usable damaging move type multiplier {best} against the enemy." if best is not None else "No damaging moves with PP remaining.")
+                speed = ""
+                if isinstance(p.get("speed"), int) and isinstance(b["enemy"].get("speed"), int):
+                    speed = f" Speed {p['speed']} vs the enemy's {b['enemy']['speed']}."
+                if status_note(p.get("status")):
+                    speed = f" It is {status_note(p['status'])}{speed}"
+                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, {'/'.join(p['types'])}, HP {p['hp']}/{p['max_hp']}). {offense}{speed} Enemy type attacks have a maximum type multiplier of {threat} against it. Uses a turn.", "switch", target=p))
         for item in state["bag"]:
             if item["name"] in HEAL and b["player"]["hp"] < b["player"]["max_hp"]:
                 options.append(Action(f"item:{item['name']}", f"Use {item['name']} to heal up to {HEAL[item['name']]} HP. Quantity {item['qty']}. Uses a turn.", "battle_item", target={"name": item["name"], "slot": b["active_slot"]}))
@@ -445,7 +598,8 @@ class Controls:
                      "AWAKENING": {"SLEEP"}, "PARLYZ HEAL": {"PARALYZED"},
                      "FULL HEAL": {"POISON", "BURN", "FREEZE", "SLEEP", "PARALYZED"}}
             if b["player"]["status"] in cures.get(item["name"], set()):
-                options.append(Action(f"cure:{item['name']}", f"Cure {b['player']['status']} with {item['name']}. Uses a turn.", "battle_item", target={"name": item["name"], "slot": b["active_slot"]}))
+                cure = status_note(b["player"]["status"])
+                options.append(Action(f"cure:{item['name']}", f"Cure {b['player']['status']} with {item['name']}. {cure} Uses a turn.".replace("  ", " "), "battle_item", target={"name": item["name"], "slot": b["active_slot"]}))
             if item["name"] in {"REVIVE", "MAX REVIVE"}:
                 for p in state["party"]:
                     if not p["hp"]:
@@ -457,7 +611,156 @@ class Controls:
         # Struggle depends on remaining PP. Switching, items, or running do not replace it.
         if not any(move["pp"] for move in b["moves"]):
             options.append(Action("struggle", "Fight with no PP remaining; the game uses STRUGGLE.", "menu", target={"label": "FIGHT"}))
+        outlook = self._outlook(state, b)
+        if outlook:
+            b["outlook"] = outlook
+            for option in options:
+                option.description += " " + outlook
         return options
+
+    def _byte(self, name):
+        if not hasattr(self.game, "u8"):
+            return None
+        try:
+            value = self.game.u8(name)
+        except (KeyError, TypeError, AttributeError):
+            return None
+        return value if isinstance(value, int) else None
+
+    def _bench_moves(self, mon, enemy):
+        lines = []
+        for move in mon.get("moves") or []:
+            if not move.get("pp"):
+                lines.append(f"{move['name']} has no PP.")
+                continue
+            lines.append(self._move_detail(mon, enemy, move))
+        return " ".join(lines)
+
+    def _move_detail(self, attacker, defender, move):
+        does = move.get("does") or describe_effect(move)
+        if not move.get("power"):
+            text = f"{move['name']}: {move.get('type', '?')}, PP {move.get('pp')}, no direct damage."
+            return f"{text} {does}".strip()
+        eff = self.game.rom.effectiveness(move["type"], defender.get("types") or [])
+        text = (f"{move['name']}: {move.get('type', '?')}, power {move['power']}, PP {move.get('pp')}, "
+                f"accuracy {move.get('accuracy')}%, type multiplier {eff}.")
+        stat = "attack" if move.get("type") in PHYSICAL else "special"
+        if attacker.get(stat):
+            high = damage(attacker, defender, move, eff)
+            low = high * 217 // 255
+            hp = defender.get("hp")
+            effect = " Likely KO." if hp and low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
+            text += f" Rough damage {low}-{high}.{effect}"
+        if does:
+            text += " " + does
+        return text
+
+    def _known(self, moves):
+        bits = []
+        for move in moves:
+            does = move.get("does") or describe_effect(move)
+            text = f"{move['name']} ({move.get('type', '?')}"
+            if move.get("power"):
+                text += f" power {move['power']}"
+            text += f", PP {move.get('pp', '?')})"
+            if does:
+                text += f" {does}"
+            bits.append(text)
+        return "; ".join(bits)
+
+    def _incoming(self, battle):
+        enemy, player = battle["enemy"], battle["player"]
+        best = None
+        for move in enemy.get("moves") or []:
+            if not move.get("power") or not move.get("pp", 1):
+                continue
+            stat = "attack" if move.get("type") in PHYSICAL else "special"
+            if not enemy.get(stat):
+                continue
+            eff = self.game.rom.effectiveness(move["type"], player.get("types") or [])
+            high = damage(enemy, player, move, eff)
+            low = high * 217 // 255
+            if best is None or high > best[0]:
+                best = (high, low, move["name"])
+        if not best:
+            return ""
+        note = f"Its {best[2]} is about {best[1]}-{best[0]} damage"
+        hp = player.get("hp")
+        if hp:
+            note += f" against your {hp} HP"
+            if best[1] >= hp:
+                note += ", enough to knock you out"
+        return note + "."
+
+    def _outlook(self, state, battle):
+        player, enemy = battle["player"], battle["enemy"]
+        parts = []
+        p_speed, e_speed = player.get("speed"), enemy.get("speed")
+        if isinstance(p_speed, int) and isinstance(e_speed, int):
+            if p_speed > e_speed:
+                parts.append(f"You act first (speed {p_speed} vs {e_speed}).")
+            elif e_speed > p_speed:
+                parts.append(f"The enemy acts first (speed {e_speed} vs {p_speed}).")
+            else:
+                parts.append(f"Speed is tied at {p_speed}; either side may move first.")
+            if battle.get("kind") == "wild":
+                attempts = self._byte("wNumRunAttempts") or 0
+                chance = escape_chance(p_speed, e_speed, attempts)
+                if chance >= 1:
+                    parts.append(f"Escape succeeds (your speed {p_speed}, enemy speed {e_speed}).")
+                else:
+                    parts.append(f"Escape chance about {round(100 * chance)}% "
+                                 f"(your speed {p_speed}, enemy speed {e_speed}, failed tries so far {attempts}). "
+                                 "A failed escape spends the turn.")
+        known = self._known(enemy.get("moves") or [])
+        if known:
+            incoming = self._incoming(battle)
+            parts.append(f"Enemy knows {known.rstrip('.')}." + (f" {incoming}" if incoming else ""))
+        if battle.get("kind") == "trainer":
+            parts.append("Trainer battle: running is impossible.")
+        else:
+            errand = (state.get("active_goal") or {}).get("goal")
+            if errand:
+                parts.append(f"Current errand: {errand}.")
+        yours, theirs = status_note(player.get("status")), status_note(enemy.get("status"))
+        if yours:
+            parts.append(f"Your active Pokémon is {yours}")
+        if theirs:
+            ball = ""
+            if battle.get("kind") == "wild":
+                ball = " A ball is much more likely to work." if enemy.get("status") in {"SLEEP", "FREEZE"} else " A ball is more likely to work."
+            parts.append(f"The enemy is {theirs}{ball}")
+        effectiveness = getattr(getattr(self.game, "rom", None), "effectiveness", None)
+        gym = next_gym(state)
+        if gym and effectiveness:
+            subject = enemy.get("species") or "The enemy"
+            line = gym_sentence(state, enemy.get("types") or [], effectiveness, subject)
+            if line:
+                parts.append(line)
+            strong, _ = gym_match(attack_types(state.get("party") or []), gym["types"], effectiveness)
+            covered = ", ".join(strong) if strong else ""
+            parts.append(f"The team already has {covered} into {gym['leader']}." if covered
+                         else f"The team has nothing strong into {gym['leader']} ({'/'.join(gym['types'])}).")
+        return " ".join(parts)
+
+    def _apply_options(self):
+        """Set FAST text and battle animations OFF, then leave.
+
+        The options menu ignores a new button for 30 frames after each press, so a
+        quicker sequence changes one setting and never registers B.
+        """
+        g = self.game
+        for _ in range(8):
+            if not self._options_open(" ".join(g.screen()["rows"])):
+                return
+            y, options = g.u8("wTopMenuItemY"), g.u8("wOptions")
+            fast, anim_off = (options & 0x0f) == 1, bool(options & 0x80)
+            if not fast:
+                g.press("left" if y == 3 else "up", 4, 32)
+            elif not anim_off:
+                g.press("right" if y == 8 else "down" if y < 8 else "up", 4, 32)
+            else:
+                g.press("b", 4, 32)
 
     def _options_open(self, rows):
         if "TEXT SPEED" in rows and "BATTLE" in rows:
@@ -484,25 +787,34 @@ class Controls:
         if weakest and enemy.get("level", 0) > weakest.get("level", 0):
             level_note += f" Higher level than your weakest, {weakest.get('nickname', weakest.get('species', '?'))} Lv{weakest.get('level', '?')}."
         full = " Your team is full: a caught Pokémon goes to the PC box." if len(party) >= 6 else ""
+        evolved = self._evo_note(enemy.get("species"))
+        evolved = f" {evolved}" if evolved else ""
         return (f"Throw {item['name']} to try catching the wild {enemy['species']}. Estimated catch chance ~{chance}%. "
-                f"{species_note} {type_note} {level_note}{full} Quantity {item['qty']}.")
+                f"{species_note} {type_note} {level_note}{full}{evolved} Quantity {item['qty']}.")
+
+    def _evo_note(self, name):
+        species = getattr(getattr(self.game, "rom", None), "species", None)
+        if not isinstance(species, dict):
+            return ""
+        record = next((sp for sp in species.values() if isinstance(sp, dict) and sp.get("name") == name), None)
+        if not record:
+            return ""
+        bits = []
+        for evo in record.get("evolutions") or []:
+            if evo.get("method") == "level":
+                bits.append(f"level {evo.get('level')}")
+            elif evo.get("method") == "item":
+                bits.append("a stone")
+            elif evo.get("method") == "trade":
+                bits.append("a trade")
+        return f"Evolves by {' or '.join(bits)}." if bits else ""
 
     def execute(self, action):
         g, t = self.game, action.target
         if action.kind == "button":
             g.press(t["button"], 4, 45)
         elif action.kind == "options":
-            g.tick(30)
-            for _ in range(4):
-                if g.u8("wTopMenuItemY") == 3:
-                    break
-                g.press("up", settle=10)
-            for _ in range(2):
-                g.press("left", settle=10)
-            if not g.u8("wOptions") & 0x80:
-                g.press("down", settle=10)
-                g.press("right", settle=10)
-            g.press("b", settle=40)
+            self._apply_options()
         elif action.kind == "wait":
             g.tick(12)
         elif action.kind == "menu":

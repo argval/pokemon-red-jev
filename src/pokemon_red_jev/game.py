@@ -3,6 +3,7 @@
 import hashlib
 from pathlib import Path
 
+from .controls import describe_effect
 from .data import Data, RED_SHA1
 from .goals import current_milestone
 
@@ -209,6 +210,11 @@ class Rom:
         return result
 
 
+def quiet_rows(rows):
+    """Menu text with the blinking cursor treated as blank."""
+    return tuple(row.replace("▶", " ").replace("▷", " ") for row in rows)
+
+
 def status(value):
     if value & 7:
         return "SLEEP"
@@ -268,9 +274,10 @@ class Game:
             self.press(direction, 3, 8)
 
     def settle_screen(self):
+        """Wait until the text stops changing. A blinking menu cursor is not a change."""
         previous, stable = None, 0
         for _ in range(120):
-            current = self.screen()["rows"]
+            current = quiet_rows(self.screen()["rows"])
             stable = stable + 1 if current == previous else 0
             if stable >= 8:
                 return
@@ -329,7 +336,11 @@ class Game:
             if mid in self.rom.moves:
                 move = self.rom.moves[mid]
                 value = self.memory[pp + i]
-                result.append({**move, "slot": i, "max_pp": move["pp"] + move["pp"] // 5 * (value >> 6), "pp": value & 63})
+                entry = {**move, "slot": i, "max_pp": move["pp"] + move["pp"] // 5 * (value >> 6), "pp": value & 63}
+                does = describe_effect(entry)
+                if does:
+                    entry["does"] = does
+                result.append(entry)
         return result
 
     def party(self):
@@ -341,6 +352,7 @@ class Game:
             result.append(dict(slot=i, species=sp.get("name", "?"), nickname=self.data.decode(self.memory[nick:nick + 11]),
                                level=self.memory[a + 33], hp=self.be16(a + 1), max_hp=self.be16(a + 34),
                                status=status(self.memory[a + 4]), types=sp.get("types", []), moves=self.moves_at(a + 8, a + 29),
+                               attack=self.be16(a + 36), defense=self.be16(a + 38), speed=self.be16(a + 40), special=self.be16(a + 42),
                                experience=(self.memory[a + 14] << 16) | (self.memory[a + 15] << 8) | self.memory[a + 16],
                                learnable_hms=[f"HM{j + 1:02}" for j in range(5)
                                               if sp.get("machines", [0] * 7)[(50 + j) // 8] & (1 << ((50 + j) % 8))]))
@@ -406,10 +418,11 @@ class Game:
             return dict(species=sp.get("name", "?"), types=sp.get("types", []), level=self.memory[a + 14],
                         hp=self.be16(a + 1), max_hp=self.be16(a + 15), status=status(self.memory[a + 4]),
                         attack=self.be16(a + 17), defense=self.be16(a + 19), speed=self.be16(a + 21), special=self.be16(a + 23),
-                        catch_rate=sp.get("catch_rate", 0), dex=sp.get("dex", 0))
-        return dict(kind="wild" if self.u8("wIsInBattle") == 1 else "trainer", player=mon("wBattleMon"),
-                    enemy=mon("wEnemyMon"), active_slot=self.u8("wPlayerMonNumber"),
-                    moves=self.moves_at(self.data.sym("wBattleMon") + 8, self.data.sym("wBattleMon") + 25),
+                        catch_rate=sp.get("catch_rate", 0), dex=sp.get("dex", 0),
+                        moves=self.moves_at(a + 8, a + 25))
+        player, enemy = mon("wBattleMon"), mon("wEnemyMon")
+        return dict(kind="wild" if self.u8("wIsInBattle") == 1 else "trainer", player=player, enemy=enemy,
+                    active_slot=self.u8("wPlayerMonNumber"), moves=player["moves"],
                     safari=self.u8("wBattleType") == 2, safari_balls=self.u8("wNumSafariBalls"))
 
     def snapshot(self):

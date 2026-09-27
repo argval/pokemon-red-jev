@@ -14,13 +14,16 @@ import zipfile
 
 from pokemon_red_jev.agent import Agent, alternate
 from pokemon_red_jev.cli import Manual, load_env
-from pokemon_red_jev.controls import (Controls, catch_chance, damage, hit_chance, menu_note, move_list_open,
-                                      note_menu, party_unusable, pc_summary, shop_note)
+from pokemon_red_jev.controls import (Controls, catch_chance, damage, describe_effect, escape_chance, hit_chance,
+                                      menu_note, move_list_open, note_menu, party_unusable, pc_summary, shop_note,
+                                      status_note)
 from pokemon_red_jev.demo import DemoGame, DemoJev, DemoNavigation, DemoPlanner, run_demo
-from pokemon_red_jev.goals import Goal, complete, current_milestone, story
-from pokemon_red_jev.game import Game
-from pokemon_red_jev.models import CodexPlanner, Jev, ModelError, Planner, codex_json, post_json
-from pokemon_red_jev.navigation import Action, Navigation, RouteMemory, boulder_actions, find_path, floor_phrase, supply_actions
+from pokemon_red_jev.goals import Goal, complete, current_milestone, next_gym, story
+from pokemon_red_jev.game import Game, quiet_rows
+from pokemon_red_jev.models import (CodexPlanner, CursorPlanner, Jev, ModelError, Planner, action_instructions,
+                                    codex_failure, codex_json, cursor_failure, cursor_json, post_json)
+from pokemon_red_jev.navigation import (Action, Navigation, RouteMemory, boulder_actions, find_path,
+                                        floor_phrase, scripted_rival_exit, supply_actions)
 from pokemon_red_jev.regions import Regions, switch_distances, switch_fact, switch_reach
 from pokemon_red_jev.stage import LINE_H, PANEL_H, PanelRenderer, overlay_lines
 
@@ -39,7 +42,7 @@ class CoreChecks(unittest.TestCase):
         records = []
         agent = run_demo(lambda kind, **fields: records.append((kind, fields)))
         self.assertEqual(agent.completed_goals, 2)
-        self.assertEqual(agent.plans, 2)
+        self.assertEqual(agent.plans, 1)
         self.assertIn("goal_end", [k for k, _ in records])
 
     def test_goal_validation_and_observed_completion(self):
@@ -148,6 +151,25 @@ class CoreChecks(unittest.TestCase):
         self.assertEqual(agent.plans, 1)
         self.assertTrue(any(r["kind"] == "planner_error" for r in records))
 
+    def test_a_completed_goal_walks_on_without_another_plan(self):
+        calls = {"n": 0}
+
+        def plan(state, catalog, previous):
+            calls["n"] += 1
+            self.assertIn("nearby_maps", state)
+            self.assertNotIn("screen", state)
+            self.assertLess(len(catalog["maps"]), 10)
+            return Goal("Cross Route 1", "progress", "VIRIDIAN_CITY", {"kind": "map", "value": "VIRIDIAN_CITY"}, 8)
+
+        agent, _ = new_agent(SimpleNamespace(plan=plan))
+        agent.step()
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(agent.goal.target_map, "VIRIDIAN_CITY")
+        agent.finish_goal("complete")
+        agent.step()
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(agent.goal.target_map, "VIRIDIAN_MART")
+
     def test_models_emit_correct_payloads_and_reject_invalid_answers(self):
         logs = []
         log = lambda kind, **fields: logs.append((kind, fields))
@@ -205,9 +227,52 @@ class CoreChecks(unittest.TestCase):
         with patch("pokemon_red_jev.models.shutil.which", return_value=None), self.assertRaises(ValueError):
             codex_json("test", {}, 1)
         with patch("pokemon_red_jev.models.shutil.which", return_value="/usr/bin/codex"), \
-             patch("pokemon_red_jev.models.subprocess.run", return_value=SimpleNamespace(returncode=7)), \
+             patch("pokemon_red_jev.models.subprocess.run", return_value=SimpleNamespace(returncode=7, stderr="", stdout="")), \
              self.assertRaisesRegex(ModelError, "exit 7"):
             planner.plan(state, catalog, None)
+        limit = SimpleNamespace(returncode=1, stderr="ERROR: You’ve hit your usage limit. Try again at 7:15 PM.\n", stdout="")
+        with patch("pokemon_red_jev.models.shutil.which", return_value="/usr/bin/codex"), \
+             patch("pokemon_red_jev.models.subprocess.run", return_value=limit), \
+             self.assertRaisesRegex(ModelError, "usage limit"):
+            planner.plan(state, catalog, None)
+        self.assertIn("usage limit", codex_failure(1, "ERROR: You’ve hit your usage limit. Upgrade to Pro.", ""))
+
+    def test_cursor_planner_uses_local_cli_and_validates_goal(self):
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        catalog = agent.catalog(state)
+        expected = DemoPlanner().plan(state, catalog, None)
+        planner = CursorPlanner(lambda *args, **kwargs: None)
+
+        def cli_run(args, **kwargs):
+            self.assertEqual(args[1:7], ["-p", "--mode", "ask", "--output-format", "json", "--sandbox"])
+            self.assertEqual(args[args.index("--sandbox") + 1], "enabled")
+            self.assertIn("--trust", args)
+            self.assertIn("--workspace", args)
+            self.assertEqual(args[args.index("--model") + 1], "composer-2.5")
+            self.assertIn("previous_goal", args[-1])
+            envelope = {"type": "result", "subtype": "success", "is_error": False,
+                        "result": json.dumps(expected.to_dict())}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr="")
+
+        with patch("pokemon_red_jev.models.cursor_agent_binary", return_value="/usr/bin/agent"), \
+             patch("pokemon_red_jev.models.subprocess.run", side_effect=cli_run):
+            self.assertEqual(planner.plan(state, catalog, None), expected)
+        with patch("pokemon_red_jev.models.cursor_agent_binary", return_value=None), self.assertRaises(ValueError):
+            cursor_json("test", 1, "composer-2.5")
+        with patch("pokemon_red_jev.models.cursor_agent_binary", return_value="/usr/bin/agent"), \
+             patch("pokemon_red_jev.models.subprocess.run",
+                   return_value=SimpleNamespace(returncode=7, stderr="", stdout="")), \
+             self.assertRaisesRegex(ModelError, "exit 7"):
+            planner.plan(state, catalog, None)
+        limit = SimpleNamespace(returncode=1, stderr="", stdout=json.dumps({
+            "type": "result", "is_error": True, "result": "You've hit your usage limit. Try again later."}))
+        with patch("pokemon_red_jev.models.cursor_agent_binary", return_value="/usr/bin/agent"), \
+             patch("pokemon_red_jev.models.subprocess.run", return_value=limit), \
+             self.assertRaisesRegex(ModelError, "usage limit"):
+            planner.plan(state, catalog, None)
+        self.assertIn("usage limit", cursor_failure(1, "", json.dumps({
+            "is_error": True, "result": "You've hit your usage limit. Upgrade to Pro."})))
 
     def test_http_json_auth_retries_and_error_redaction(self):
         class Response(io.BytesIO):
@@ -269,8 +334,10 @@ class CoreChecks(unittest.TestCase):
         game.memory[0xc300:0xc303] = bytes([0x80, 0x81, 0x50])
         game.memory[0xc400] = 1
         game.memory[0xc410:0xc412] = bytes([1, 3])
+        game.memory[0xc124:0xc12c] = bytes([0, 49, 0, 40, 0, 30, 0, 35])
         p = game.party()[0]
         self.assertEqual((p["nickname"], p["hp"], p["max_hp"], p["level"], p["status"]), ("AB", 258, 300, 12, "POISON"))
+        self.assertEqual((p["attack"], p["defense"], p["speed"], p["special"]), (49, 40, 30, 35))
         self.assertEqual((p["moves"][0]["pp"], p["moves"][0]["max_pp"]), (7, 42))
         self.assertEqual(game.bag(), [{"name": "POTION", "qty": 3}])
         game.memory[0xc500:0xc500 + 360] = bytes([0x7f] * 360)
@@ -612,6 +679,120 @@ class CoreChecks(unittest.TestCase):
         self.assertIn("NEW species", ball)
         self.assertIn("not on your team", ball)
 
+    def test_battle_snapshot_includes_the_enemy_moveset(self):
+        from pokemon_red_jev.data import Data
+        data = object.__new__(Data)
+        data.symbols = {"wIsInBattle": 0xc000, "wBattleType": 0xc001, "wPlayerMonNumber": 0xc002,
+                        "wNumSafariBalls": 0xc003, "wBattleMon": 0xc100, "wEnemyMon": 0xc200}
+        game = object.__new__(Game)
+        game.data, game.memory = data, bytearray(65536)
+        game.rom = SimpleNamespace(species={
+            1: {"name": "RATTATA", "types": ["NORMAL"], "catch_rate": 255, "dex": 19},
+            2: {"name": "PIDGEY", "types": ["NORMAL", "FLYING"], "catch_rate": 255, "dex": 16}},
+            moves={1: {"name": "TACKLE", "type": "NORMAL", "power": 35, "accuracy": 95, "pp": 35, "effect": 0},
+                   2: {"name": "GUST", "type": "FLYING", "power": 40, "accuracy": 100, "pp": 35, "effect": 0}})
+        game.memory[0xc000] = 1
+        game.memory[0xc100] = 1
+        game.memory[0xc108] = 1
+        game.memory[0xc200] = 2
+        game.memory[0xc208] = 2
+        game.memory[0xc200 + 25] = 10
+        battle = game.battle()
+        self.assertEqual(battle["kind"], "wild")
+        self.assertEqual(battle["moves"][0]["name"], "TACKLE")
+        self.assertEqual(battle["enemy"]["species"], "PIDGEY")
+        self.assertEqual((battle["enemy"]["moves"][0]["name"], battle["enemy"]["moves"][0]["pp"]), ("GUST", 10))
+
+    def test_wild_battle_shows_escape_enemy_moves_and_the_bench(self):
+        self.assertEqual(escape_chance(40, 18), 1)
+        self.assertEqual(escape_chance(79, 165), 62 / 256)
+        self.assertEqual(escape_chance(79, 165, 1), 92 / 256)
+        self.assertEqual(describe_effect({"name": "SLEEP POWDER", "effect": 0x20}), "Puts the target to sleep.")
+        wild_rules = action_instructions({"mode": "battle", "battle": {"kind": "wild"}})
+        self.assertIn("Judge this turn", wild_rules)
+        self.assertIn("Escape when the escape is likely", wild_rules)
+        self.assertIn("Running is impossible", action_instructions({"mode": "battle", "battle": {"kind": "trainer"}}))
+        self.assertIn("prefer that step", action_instructions({"mode": "overworld"}))
+        player = dict(level=12, attack=30, defense=20, special=30, speed=20, types=["WATER"],
+                      hp=30, max_hp=30, status="OK", slot=0)
+        enemy = dict(level=8, attack=28, defense=16, special=16, speed=80, types=["NORMAL"], hp=22, max_hp=22,
+                     status="OK", species="RATTATA", catch_rate=255, dex=19,
+                     moves=[dict(name="TACKLE", type="NORMAL", power=35, pp=30, accuracy=95, effect=0)])
+        bench = dict(nickname="BLUE", species="PIDGEY", level=11, hp=24, max_hp=24, types=["NORMAL", "FLYING"],
+                     slot=1, attack=24, defense=18, speed=26, special=18,
+                     moves=[dict(name="GUST", type="FLYING", power=40, pp=15, accuracy=100, effect=0),
+                            dict(name="SAND-ATTACK", type="NORMAL", power=0, pp=10, accuracy=100, effect=0x16)])
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=lambda attack, defense: 1),
+                               u8=lambda name: 0 if name == "wNumRunAttempts" else 7, owned=lambda dex: True)
+        state = dict(map="ROUTE_1", mode="battle", active_goal={"focus": "progress", "goal": "Reach the mart"},
+                     party=[dict(nickname="JEV", species="SQUIRTLE", level=12, hp=30, max_hp=30, types=["WATER"], slot=0, moves=[]),
+                            bench],
+                     bag=[], battle=dict(kind="wild", player=player, enemy=enemy, active_slot=0, safari=False,
+                                         moves=[dict(name="BUBBLE", type="WATER", power=20, pp=30, accuracy=100, slot=0,
+                                                     effect=0x46)]))
+        actions = {a.key: a for a in Controls(game).battle_actions(state)}
+        move, switch = actions["move:0"].description, actions["switch:1"].description
+        self.assertIn("May lower the target's Speed", move)
+        self.assertIn("Enemy knows TACKLE", move)
+        self.assertIn("The enemy acts first", move)
+        self.assertIn("Escape chance about", move)
+        self.assertIn("failed tries so far 0", move)
+        self.assertIn("Current errand: Reach the mart.", move)
+        self.assertIn("GUST:", switch)
+        self.assertIn("type multiplier 1", switch)
+        self.assertIn("SAND-ATTACK", switch)
+        self.assertIn("Lowers the target's accuracy", switch)
+        self.assertIn("Speed 26 vs the enemy's 80", switch)
+        self.assertNotIn("run", {a.key: a for a in Controls(game).battle_actions(
+            dict(state, battle=dict(state["battle"], kind="trainer")))})
+        trainer = Controls(game).battle_actions(dict(state, battle=dict(state["battle"], kind="trainer")))
+        self.assertIn("running is impossible", trainer[0].description)
+
+    def test_status_and_the_next_gym_are_part_of_the_battle_choice(self):
+        self.assertIn("loses HP every turn", status_note("POISON"))
+        self.assertIn("cannot move", status_note("SLEEP"))
+        self.assertEqual(status_note("OK"), "")
+        self.assertEqual(next_gym({"milestone": {"id": "parcel"}})["leader"], "Brock")
+        self.assertEqual(next_gym({}) , None)
+        chart = {("GRASS", "ROCK"): 2, ("GRASS", "GROUND"): 2, ("NORMAL", "ROCK"): 0.5, ("WATER", "ROCK"): 2, ("WATER", "GROUND"): 2}
+
+        def effectiveness(attack, defense):
+            score = 1
+            for typing in defense:
+                score *= chart.get((attack, typing), 1)
+            return score
+
+        player = dict(level=12, attack=30, defense=20, special=30, speed=20, types=["NORMAL"],
+                      hp=18, max_hp=30, status="POISON", slot=0, species="RATTATA")
+        enemy = dict(level=10, attack=20, defense=16, special=20, speed=18, types=["GRASS"], hp=24, max_hp=28,
+                     status="SLEEP", species="ODDISH", catch_rate=255, dex=43,
+                     moves=[dict(name="ABSORB", type="GRASS", power=20, pp=20, accuracy=100, effect=3)])
+        bench = dict(nickname="BLUE", species="SQUIRTLE", level=12, hp=30, max_hp=30, types=["WATER"], slot=1,
+                     status="OK", attack=24, defense=24, speed=18, special=24,
+                     moves=[dict(name="BUBBLE", type="WATER", power=20, pp=30, accuracy=100)])
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=effectiveness, species={
+            43: {"name": "ODDISH", "evolutions": [{"method": "level", "level": 21}]}}),
+            u8=lambda name: 0 if name == "wNumRunAttempts" else 7, owned=lambda dex: False)
+        state = dict(map="ROUTE_1", mode="battle", milestone={"id": "brock"},
+                     active_goal={"focus": "catch", "goal": "Find a Pokémon for Brock"},
+                     party=[dict(nickname="JEV", species="RATTATA", level=12, hp=18, max_hp=30, types=["NORMAL"],
+                                 status="POISON", slot=0, moves=[dict(name="TACKLE", type="NORMAL", power=35, pp=30)]),
+                            bench],
+                     bag=[{"name": "ANTIDOTE", "qty": 1}, {"name": "POKé BALL", "qty": 2}],
+                     battle=dict(kind="wild", player=player, enemy=enemy, active_slot=0, safari=False,
+                                 moves=[dict(name="TACKLE", type="NORMAL", power=35, pp=30, accuracy=95, slot=0, effect=0)]))
+        actions = {a.key: a for a in Controls(game).battle_actions(state)}
+        move, ball, cure, switch = (actions["move:0"].description, actions["ball:POKé BALL"].description,
+                                    actions["cure:ANTIDOTE"].description, actions["switch:1"].description)
+        self.assertIn("Your active Pokémon is poisoned", move)
+        self.assertIn("The enemy is asleep", move)
+        self.assertIn("much more likely", move)
+        self.assertIn("strong into the next gym, Brock", move)
+        self.assertIn("The team already has WATER into Brock", move)
+        self.assertIn("Evolves by level 21", ball)
+        self.assertIn("loses HP every turn", cure)
+        self.assertIn("BUBBLE:", switch)
+
     def test_three_failures_stay_available_and_another_option_is_tried(self):
         self.assertEqual(alternate("exit:up", {"exit:up": "North", "exit:down": "South"}, {}, "here",
                                    {"exit:up": 0.9, "exit:down": 0.1}), "exit:up")
@@ -658,6 +839,75 @@ class CoreChecks(unittest.TestCase):
         kinds = [controls.actions({"mode": "dialog"})[0].key for _ in range(40)]
         self.assertEqual(kinds[-1], "cancel")
         self.assertTrue(all(key == "wait" for key in kinds[:-1]))
+        self.assertEqual(quiet_rows(["▶HELLO", "▷HELLO"]), (" HELLO", " HELLO"))
+
+        class Blink:
+            def __init__(self):
+                self.n = self.ticks = 0
+
+            def screen(self):
+                mark = "▶" if self.n % 2 else "▷"
+                self.n += 1
+                return {"rows": [mark + "TEXT SPEED", "BATTLE ANIMATION"]}
+
+            def tick(self, frames=1):
+                self.ticks += frames
+
+        blink = Blink()
+        Game.settle_screen(blink)
+        self.assertLess(blink.ticks, 30)
+
+    def test_options_presses_clear_the_menu_lockout(self):
+        box = {"y": 3, "options": 3, "open": True}
+        presses = []
+
+        def screen():
+            rows = ["TEXT SPEED", "BATTLE ANIMATION", "BATTLE STYLE", "CANCEL"] if box["open"] else ["NEW GAME", "OPTION"]
+            return {"rows": rows}
+
+        def press(button, hold=6, settle=12):
+            presses.append((button, settle))
+            if button == "left" and box["y"] == 3:
+                box["options"] = (box["options"] & 0xf0) | 1
+            elif button == "down" and box["y"] == 3:
+                box["y"] = 8
+            elif button == "right" and box["y"] == 8:
+                box["options"] |= 0x80
+            elif button == "b" and box["options"] & 0x8f == 0x81:
+                box["open"] = False
+
+        game = SimpleNamespace(screen=screen, press=press, tick=lambda n=1: None,
+                               u8=lambda name: box["y"] if name == "wTopMenuItemY" else box["options"])
+        Controls(game).execute(Action("options", "Set options", "options"))
+        self.assertFalse(box["open"])
+        self.assertEqual(box["options"] & 0x8f, 0x81)
+        self.assertEqual([button for button, _ in presses], ["left", "down", "right", "b"])
+        self.assertTrue(all(settle >= 30 for _, settle in presses))
+
+    def test_title_menu_starts_the_game_instead_of_backing_out(self):
+        cells = [[" "] * 20 for _ in range(18)]
+        for y, text in ((2, "│▶NEW GAME    │"), (4, "│ OPTION      │")):
+            cells[y][:len(text)] = list(text)
+        screen = {"rows": ["".join(row) for row in cells], "cells": cells, "cursor": (1, 2), "waiting": False}
+        addrs = {"wTopMenuItemY": 2, "wTopMenuItemX": 1, "wMaxMenuItem": 1, "wOptions": 0x81}
+        game = SimpleNamespace(settle_screen=lambda: None, screen=lambda: screen, menu_ready=lambda: True,
+                               u8=lambda name: addrs[name], rom=SimpleNamespace(items={}), party=lambda: [])
+        keys = [a.key for a in Controls(game).actions({"mode": "dialog", "party": [], "bag": [], "battle": None})]
+        self.assertEqual(keys, ["menu:0"])
+        self.assertEqual(Controls(game).actions({"mode": "dialog", "party": [], "bag": [], "battle": None})[0].description,
+                         "Start a new game.")
+
+    def test_oaks_lab_rival_battle_is_at_the_door(self):
+        ready = dict(map="OAKS_LAB", party=[{"species": "BULBASAUR"}], events=[])
+        self.assertTrue(scripted_rival_exit(ready))
+        self.assertFalse(scripted_rival_exit(dict(ready, party=[])))
+        self.assertFalse(scripted_rival_exit(dict(ready, events=["EVENT_BATTLED_RIVAL_IN_OAKS_LAB"])))
+        self.assertFalse(scripted_rival_exit(dict(ready, map="PALLET_TOWN")))
+        # Talking to RIVAL1/BLUE is omitted; the lab doors are the fight trigger.
+        rival = {"index": 1, "trainer_class": "RIVAL1"}
+        oak = {"index": 5, "trainer_class": None}
+        self.assertTrue(ready["party"] and rival.get("trainer_class") == "RIVAL1")
+        self.assertFalse(oak.get("trainer_class") == "RIVAL1")
 
     def test_story_room_survives_an_arrival_only_goal(self):
         nav = Navigation.__new__(Navigation)

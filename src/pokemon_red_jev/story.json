@@ -1,0 +1,548 @@
+[
+  {
+    "id": "meet_oak",
+    "goal": "Leave the house and walk north out of Pallet Town toward Route 1; Professor Oak will stop you and bring you to his lab.",
+    "maps": [
+      "ROUTE_1"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_FOLLOWED_OAK_INTO_LAB"
+    }
+  },
+  {
+    "id": "starter",
+    "goal": "In Oak's lab, choose a starter Pokémon from the Poké Balls on the table.",
+    "maps": [
+      "OAKS_LAB"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_STARTER"
+    }
+  },
+  {
+    "id": "rival1",
+    "goal": "Battle your rival in Oak's lab (he challenges you as you try to leave).",
+    "maps": [
+      "OAKS_LAB"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BATTLED_RIVAL_IN_OAKS_LAB"
+    },
+    "level": 5
+  },
+  {
+    "id": "parcel",
+    "goal": "Go north through Route 1 to Viridian City and enter the Poké Mart to receive Oak's Parcel.",
+    "maps": [
+      "VIRIDIAN_MART"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_OAKS_PARCEL"
+    },
+    "level": 4
+  },
+  {
+    "id": "deliver_parcel",
+    "goal": "Bring Oak's Parcel back to Professor Oak in his lab in Pallet Town and talk to him.",
+    "maps": [
+      "OAKS_LAB"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_POKEDEX"
+    }
+  },
+  {
+    "id": "viridian_forest",
+    "goal": "Head north from Viridian City through Route 2 and Viridian Forest toward Pewter City.",
+    "maps": [
+      "PEWTER_CITY"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "PEWTER_CITY"
+        },
+        {
+          "kind": "badge_count",
+          "value": 1
+        }
+      ]
+    },
+    "level": 9
+  },
+  {
+    "id": "brock",
+    "goal": "Defeat Brock, the Pewter City Gym Leader (Rock/Ground Pokémon, Lv12-14). Water, Grass and Fighting moves are strong against him; Fire and Normal moves are weak against Rock.",
+    "maps": [
+      "PEWTER_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 1
+    },
+    "level": 14,
+    "types": [
+      "ROCK",
+      "GROUND"
+    ]
+  },
+  {
+    "id": "mt_moon",
+    "goal": "Travel east from Pewter City along Route 3 and through Mt. Moon to reach Route 4 and Cerulean City.",
+    "maps": [
+      "CERULEAN_CITY"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "CERULEAN_CITY"
+        },
+        {
+          "kind": "badge_count",
+          "value": 2
+        }
+      ]
+    },
+    "level": 14
+  },
+  {
+    "id": "misty",
+    "goal": "Defeat Misty, the Cerulean City Gym Leader (Water type). Electric or Grass moves are strong against her; Fire moves are weak against Water. Her team: Staryu Lv18 and Starmie Lv21 (Water/Psychic).",
+    "maps": [
+      "CERULEAN_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 2
+    },
+    "level": 21,
+    "types": [
+      "WATER"
+    ]
+  },
+  {
+    "id": "bill",
+    "goal": "Go north across Nugget Bridge (Route 24) and east on Route 25 to Bill's house; help Bill and get the S.S. Ticket.",
+    "maps": [
+      "BILLS_HOUSE"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_SS_TICKET"
+    },
+    "level": 20
+  },
+  {
+    "id": "ss_anne",
+    "goal": "Go south from Cerulean through Route 5, the Underground Path and Route 6 to Vermilion City; board the S.S. Anne at the dock and get HM01 (Cut) from the captain.",
+    "maps": [
+      "SS_ANNE_CAPTAINS_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_HM01"
+    },
+    "level": 22
+  },
+  {
+    "id": "surge",
+    "goal": "Defeat Lt. Surge at the Vermilion City Gym (Electric type; Ground moves are strong). A small tree blocks the gym entrance.",
+    "maps": [
+      "VERMILION_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 3
+    },
+    "level": 24,
+    "types": [
+      "ELECTRIC"
+    ]
+  },
+  {
+    "id": "rock_tunnel",
+    "goal": "Go back to Cerulean, east via Route 9 to Rock Tunnel (Route 10), and through it south to Lavender Town.",
+    "maps": [
+      "LAVENDER_TOWN"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "LAVENDER_TOWN"
+        },
+        {
+          "kind": "badge_count",
+          "value": 4
+        }
+      ]
+    },
+    "level": 26
+  },
+  {
+    "id": "celadon",
+    "goal": "Go west from Lavender Town via Route 8 and the Underground Path to Celadon City.",
+    "maps": [
+      "CELADON_CITY"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "CELADON_CITY"
+        },
+        {
+          "kind": "badge_count",
+          "value": 4
+        }
+      ]
+    },
+    "level": 28
+  },
+  {
+    "id": "erika",
+    "goal": "Defeat Erika at the Celadon City Gym (Grass type; Fire, Ice, Flying moves are strong).",
+    "maps": [
+      "CELADON_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 4
+    },
+    "level": 29,
+    "types": [
+      "GRASS"
+    ]
+  },
+  {
+    "id": "rocket_hideout",
+    "goal": "Find the Team Rocket Hideout under the Celadon Game Corner (poster switch), get the Lift Key, and defeat Giovanni to get the Silph Scope.",
+    "maps": [
+      "ROCKET_HIDEOUT_B4F"
+    ],
+    "success": {
+      "kind": "all",
+      "value": [
+        {
+          "kind": "event",
+          "value": "EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI"
+        },
+        {
+          "kind": "item",
+          "value": "SILPH SCOPE"
+        }
+      ]
+    },
+    "level": 30,
+    "at": {
+      "map": "ROCKET_HIDEOUT_B4F",
+      "x": 25,
+      "y": 4
+    }
+  },
+  {
+    "id": "pokemon_tower",
+    "goal": "In Lavender Town, climb Pokémon Tower with the Silph Scope, defeat the Marowak ghost and rescue Mr. Fuji at the top.",
+    "maps": [
+      "POKEMON_TOWER_7F"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_RESCUED_MR_FUJI"
+    },
+    "level": 32,
+    "types": [
+      "GHOST",
+      "POISON"
+    ],
+    "dual_type": true
+  },
+  {
+    "id": "poke_flute",
+    "goal": "Talk to Mr. Fuji in his house in Lavender Town to receive the Poké Flute.",
+    "maps": [
+      "MR_FUJIS_HOUSE"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "event",
+          "value": "EVENT_GOT_POKE_FLUTE"
+        },
+        {
+          "kind": "item",
+          "value": "POKé FLUTE"
+        }
+      ]
+    },
+    "level": 32
+  },
+  {
+    "id": "fuchsia",
+    "goal": "Travel to Fuchsia City (via Route 12-15 using the Poké Flute on Snorlax, or Cycling Road via Route 16-18).",
+    "maps": [
+      "FUCHSIA_CITY"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "FUCHSIA_CITY"
+        },
+        {
+          "kind": "badge_count",
+          "value": 5
+        }
+      ]
+    },
+    "level": 34
+  },
+  {
+    "id": "koga",
+    "goal": "Defeat Koga at the Fuchsia City Gym (Poison type; Psychic and Ground moves are strong).",
+    "maps": [
+      "FUCHSIA_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 5
+    },
+    "level": 43,
+    "types": [
+      "POISON"
+    ]
+  },
+  {
+    "id": "surf",
+    "goal": "In the Safari Zone (north of Fuchsia), reach the Secret House to get HM03 (Surf); also find the Gold Teeth and give them to the Warden for HM04 (Strength).",
+    "maps": [
+      "SAFARI_ZONE_SECRET_HOUSE"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_HM03"
+    },
+    "level": 36
+  },
+  {
+    "id": "strength",
+    "goal": "Give the Gold Teeth to the Safari Zone Warden in Fuchsia City to get HM04 (Strength).",
+    "maps": [
+      "WARDENS_HOUSE"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_GOT_HM04"
+    },
+    "level": 36
+  },
+  {
+    "id": "silph",
+    "goal": "Enter Silph Co. in Saffron City (give the guard a drink from the Celadon rooftop vending machine to pass), use the Card Key, and defeat Giovanni.",
+    "maps": [
+      "SILPH_CO_11F"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_SILPH_CO_GIOVANNI"
+    },
+    "level": 41,
+    "at": {
+      "map": "SILPH_CO_11F",
+      "x": 6,
+      "y": 10
+    },
+    "needs": [
+      {
+        "items": [
+          "FRESH WATER",
+          "SODA POP",
+          "LEMONADE",
+          "CARD KEY"
+        ],
+        "done_flag": "saffron_open",
+        "map": "CELADON_MART_ROOF",
+        "what": "Get a drink from the rooftop vending machine for the Saffron guard."
+      },
+      {
+        "items": [
+          "CARD KEY"
+        ],
+        "map": "SILPH_CO_5F",
+        "what": "Get the Card Key in Silph Co.",
+        "at": {
+          "map": "SILPH_CO_5F",
+          "x": 21,
+          "y": 16
+        }
+      }
+    ]
+  },
+  {
+    "id": "sabrina",
+    "goal": "Defeat Sabrina at the Saffron City Gym (Psychic type; Bug moves are strong, teleport pads connect the rooms).",
+    "maps": [
+      "SAFFRON_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 6
+    },
+    "level": 43,
+    "types": [
+      "PSYCHIC"
+    ]
+  },
+  {
+    "id": "cinnabar",
+    "goal": "Surf south from Pallet Town (Route 21) to Cinnabar Island. Explore the Pokémon Mansion to find the Secret Key.",
+    "maps": [
+      "POKEMON_MANSION_B1F"
+    ],
+    "success": {
+      "kind": "item",
+      "value": "SECRET KEY"
+    },
+    "level": 40
+  },
+  {
+    "id": "blaine",
+    "goal": "Defeat Blaine at the Cinnabar Island Gym (Fire type; Water and Ground moves are strong).",
+    "maps": [
+      "CINNABAR_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 7
+    },
+    "level": 47,
+    "types": [
+      "FIRE"
+    ]
+  },
+  {
+    "id": "giovanni",
+    "goal": "Defeat Giovanni at the Viridian City Gym (Ground type; Water, Grass and Ice moves are strong).",
+    "maps": [
+      "VIRIDIAN_GYM"
+    ],
+    "success": {
+      "kind": "badge",
+      "value": 8
+    },
+    "level": 50,
+    "types": [
+      "GROUND"
+    ]
+  },
+  {
+    "id": "victory_road",
+    "goal": "Go west from Viridian City along Route 22 and north on Route 23 through the badge gates to Victory Road; push boulders onto switches with Strength to reach Indigo Plateau.",
+    "maps": [
+      "INDIGO_PLATEAU_LOBBY"
+    ],
+    "success": {
+      "kind": "any",
+      "value": [
+        {
+          "kind": "visited",
+          "value": "INDIGO_PLATEAU_LOBBY"
+        },
+        {
+          "kind": "event",
+          "value": "EVENT_BEAT_LORELEIS_ROOM_TRAINER_0"
+        }
+      ]
+    },
+    "level": 48
+  },
+  {
+    "id": "lorelei",
+    "goal": "Elite Four: defeat Lorelei (Ice/Water). Inside the Elite Four the battles are back to back: no Pokémon Center until the end, and healing is only possible with items between and during battles.",
+    "maps": [
+      "LORELEIS_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_LORELEIS_ROOM_TRAINER_0"
+    },
+    "level": 56,
+    "types": [
+      "ICE",
+      "WATER"
+    ]
+  },
+  {
+    "id": "bruno",
+    "goal": "Elite Four: defeat Bruno (Fighting/Rock). Inside the Elite Four the battles are back to back: no Pokémon Center until the end, and healing is only possible with items between and during battles.",
+    "maps": [
+      "BRUNOS_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_BRUNOS_ROOM_TRAINER_0"
+    },
+    "level": 58,
+    "types": [
+      "FIGHTING",
+      "ROCK"
+    ]
+  },
+  {
+    "id": "agatha",
+    "goal": "Elite Four: defeat Agatha (Ghost/Poison). Inside the Elite Four the battles are back to back: no Pokémon Center until the end, and healing is only possible with items between and during battles.",
+    "maps": [
+      "AGATHAS_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_AGATHAS_ROOM_TRAINER_0"
+    },
+    "level": 60,
+    "types": [
+      "GHOST",
+      "POISON"
+    ]
+  },
+  {
+    "id": "lance",
+    "goal": "Elite Four: defeat Lance (Dragon/Flying). Inside the Elite Four the battles are back to back: no Pokémon Center until the end, and healing is only possible with items between and during battles.",
+    "maps": [
+      "LANCES_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_LANCE"
+    },
+    "level": 62,
+    "types": [
+      "DRAGON",
+      "FLYING"
+    ]
+  },
+  {
+    "id": "champion",
+    "goal": "Defeat your rival, the Champion, and enter the Hall of Fame. This battle directly follows the Elite Four, with no Pokémon Center in between.",
+    "maps": [
+      "CHAMPIONS_ROOM"
+    ],
+    "success": {
+      "kind": "event",
+      "value": "EVENT_BEAT_CHAMPION_RIVAL"
+    },
+    "level": 65
+  }
+]

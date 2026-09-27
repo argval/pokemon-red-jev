@@ -1,0 +1,20 @@
+[project]
+name = "pokemon-red-jev"
+version = "0.1.0"
+description = "A local Pokémon Red player with an LLM planner and Jev action selection"
+license = "GPL-2.0-or-later"
+readme = "README.md"
+authors = [
+    { name = "argval", email = "anuragr.vallur@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pyboy>=2.7.0",
+]
+
+[project.scripts]
+pokemon-red-jev = "pokemon_red_jev:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"

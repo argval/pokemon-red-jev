@@ -1,0 +1,641 @@
+"""Offline checks: run `uv run python -m unittest discover -s tests -v`."""
+
+from copy import deepcopy
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
+import zipfile
+
+from pokemon_red_jev.agent import Agent, alternate
+from pokemon_red_jev.cli import Manual, load_env
+from pokemon_red_jev.controls import (Controls, catch_chance, damage, hit_chance, menu_note, move_list_open,
+                                      note_menu, party_unusable, pc_summary, shop_note)
+from pokemon_red_jev.demo import DemoGame, DemoJev, DemoNavigation, DemoPlanner, run_demo
+from pokemon_red_jev.goals import Goal, complete, current_milestone, story
+from pokemon_red_jev.game import Game
+from pokemon_red_jev.models import CodexPlanner, Jev, ModelError, Planner, codex_json, post_json
+from pokemon_red_jev.navigation import Action, RouteMemory, boulder_actions, find_path, floor_phrase, supply_actions
+from pokemon_red_jev.regions import Regions, switch_distances, switch_fact, switch_reach
+from pokemon_red_jev.stage import LINE_H, PANEL_H, PanelRenderer, overlay_lines
+
+
+def new_agent(planner=None):
+    game = DemoGame()
+    nav = DemoNavigation(game)
+    records = []
+    agent = Agent(game, planner or DemoPlanner(), DemoJev(nav), nav, None,
+                  lambda kind, **fields: records.append({"kind": kind, **fields}))
+    return agent, records
+
+
+class CoreChecks(unittest.TestCase):
+    def test_demo_uses_loop_and_verifies_two_goals(self):
+        records = []
+        agent = run_demo(lambda kind, **fields: records.append((kind, fields)))
+        self.assertEqual(agent.completed_goals, 2)
+        self.assertEqual(agent.plans, 2)
+        self.assertIn("goal_end", [k for k, _ in records])
+
+    def test_goal_validation_and_observed_completion(self):
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        catalog = agent.catalog(state)
+        goal = DemoPlanner().plan(state, catalog, None)
+        self.assertFalse(goal.done(state))
+        healthy = deepcopy(state)
+        healthy["party"][0]["hp"] = 20
+        self.assertTrue(goal.done(healthy))
+        healthy["party"] = []
+        self.assertFalse(goal.done(healthy), "An empty party is not a healed party")
+        for change in [{"target_map": "IMAGINARY"}, {"max_decisions": True}, {"max_decisions": 1000},
+                       {"success": {"kind": "event", "value": "EVENT_INVENTED"}},
+                       {"success": {"kind": "level", "value": False}}, {"focus": []},
+                       {"success": {"kind": "map", "value": "ROUTE_1"}},
+                       {"success": {"kind": "python", "value": "print(1)"}}]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                Goal.parse({**goal.to_dict(), **change}, catalog)
+        item = {"kind": "item", "value": "OAK'S PARCEL"}
+        state["bag"] = [{"name": "OAK'S PARCEL", "qty": 0}]
+        self.assertFalse(complete(item, state))
+        state["bag"][0]["qty"] = 1
+        self.assertTrue(complete(item, state))
+
+    def test_story_has_33_milestones_and_specific_badge_checks(self):
+        self.assertEqual(len(story()), 33)
+        state = DemoGame().snapshot()
+        self.assertEqual(current_milestone(state)["id"], "meet_oak")
+        state["badges"] = 2
+        self.assertFalse(complete({"kind": "badge", "value": 1}, state))
+        self.assertTrue(complete({"kind": "badge", "value": 2}, state))
+        for milestone in story():
+            self.assertIsInstance(complete(milestone["success"], state), bool)
+
+    def test_overlay_matches_stream_panel_sections_and_font(self):
+        state = DemoGame().snapshot()
+        state["milestone"] = current_milestone(state)
+        state["badges"] = 0b101
+        controller = SimpleNamespace(calls=1200, input_tokens=1_000_000, last={
+            "purpose": "overworld", "picked": "talk", "probabilities": {"talk": 0.72, "walk": 0.2}})
+        with patch.dict(os.environ, {"JEV_PRICE_PER_M": "0.042"}):
+            lines = overlay_lines(state, controller, 36)
+        self.assertEqual(lines[0], "# JEV PLAYS POKEMON RED")
+        self.assertEqual(lines[1], "~ 2 badges | milestone 0/33")
+        self.assertEqual(lines[2], "~ 1,200 jev calls | 1,000,000 tokens")
+        self.assertEqual(lines[3], "~ total cost: $0.042 USD")
+        self.assertLess(lines.index("# MILESTONE"), lines.index("# GOAL"))
+        self.assertIn("~ none yet", lines)
+        state["active_goal"] = {"goal": "Speak to Professor Oak"}
+        with patch.dict(os.environ, {"JEV_PRICE_PER_M": "0.042"}):
+            lines = overlay_lines(state, controller, 36)
+        milestone_at, goal_at = lines.index("# MILESTONE"), lines.index("# GOAL")
+        self.assertLess(milestone_at, goal_at)
+        self.assertTrue(any(state["milestone"]["goal"].split()[0] in line for line in lines[milestone_at:goal_at]))
+        self.assertEqual(lines[goal_at + 1], "Speak to Professor Oak")
+        self.assertLessEqual(len(lines), PANEL_H // LINE_H)
+        state["party"] = [dict(nickname=f"N{i}", species="PIDGEY", level=12, hp=30, max_hp=40) for i in range(6)]
+        state["milestone"]["goal"] = "Defeat Brock, the Pewter City Gym Leader (Rock/Ground Pokémon, Lv12-14). Water, Grass and Fighting moves are strong against him."
+        state["active_goal"] = {"goal": "Enter Pewter Gym and fight Brock after healing at the Pokemon Center so the party is ready."}
+        controller.last = {"purpose": "overworld", "picked": "door:0", "probabilities": {"door:0": 0.5, "npc:1": 0.3, "explore": 0.2}}
+        full = overlay_lines(state, controller, 36)
+        self.assertLessEqual(len(full), PANEL_H // LINE_H)
+        self.assertLess(full.index("# JEV DECISION (overworld)"), full.index("~  50% door:0"))
+        self.assertIn("# WHERE", lines)
+        self.assertIn("ROUTE 1", lines)
+        team = next(line for line in lines if "BULBASAUR" in line)
+        self.assertIn("BULBASAUR (JEV)", team)
+        self.assertIn("Lv5", team)
+        self.assertIn("8/20", team)
+        self.assertLess(lines.index("# JEV DECISION (overworld)"), lines.index("~  72% talk"))
+        self.assertLess(lines.index("~  72% talk"), lines.index("~  20% walk"))
+        image = PanelRenderer(bytes([0xFF] * 8), 0, {0x80: "A"}).render(["# A", "~ A"])
+        self.assertEqual(list(image[0:4]), [21, 21, 20, 255])
+        self.assertEqual(list(image[(1 * 288) * 4:(1 * 288) * 4 + 3]), [124, 196, 155])
+        self.assertEqual(list(image[(11 * 288) * 4:(11 * 288) * 4 + 3]), [154, 154, 146])
+
+    def test_budget_replans_but_never_counts_timeout_as_success(self):
+        agent, records = new_agent()
+        agent.step()
+        agent.goal.max_decisions = 1
+        agent.step()
+        ends = [r for r in records if r["kind"] == "goal_end"]
+        self.assertEqual(ends[0]["outcome"], "decision budget exhausted")
+        self.assertEqual(agent.completed_goals, 0)
+        self.assertEqual(agent.plans, 2)
+
+    def test_stall_replans_once_and_retains_failed_action_evidence(self):
+        agent, records = new_agent()
+        agent.navigation.execute = lambda action: None
+        for _ in range(9):
+            agent.step()
+        self.assertEqual(agent.plans, 2)
+        self.assertTrue(any(r.get("outcome") == "stalled" for r in records))
+        self.assertTrue(agent.failures)
+        self.assertEqual(agent.completed_goals, 0)
+
+    def test_planner_failure_has_bounded_fallback(self):
+        planner = SimpleNamespace(plan=lambda *args: (_ for _ in ()).throw(ModelError("timeout")))
+        agent, records = new_agent(planner)
+        agent.step()
+        self.assertEqual(agent.goal.max_decisions, 10)
+        self.assertEqual(agent.goal.target_map, "VIRIDIAN_MART")
+        agent.step()
+        self.assertEqual(agent.plans, 1)
+        self.assertTrue(any(r["kind"] == "planner_error" for r in records))
+
+    def test_models_emit_correct_payloads_and_reject_invalid_answers(self):
+        logs = []
+        log = lambda kind, **fields: logs.append((kind, fields))
+        env = {"TYPESAFE_API_KEY": "test-key", "LLM_API_KEY": "test-key", "LLM_MODEL": "test/model", "JEV_MIN_INTERVAL_MS": "0"}
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        catalog = agent.catalog(state)
+        expected = DemoPlanner().plan(state, catalog, None)
+        with patch.dict(os.environ, env):
+            planner, jev = Planner(log), Jev(log)
+        with patch("pokemon_red_jev.models.post_json") as post:
+            post.return_value = {"choices": [{"message": {"content": json.dumps(expected.to_dict())}}]}
+            actual = planner.plan(state, catalog, None)
+            self.assertEqual(actual, expected)
+            payload = post.call_args.args[2]
+            self.assertEqual(payload["model"], "test/model")
+            self.assertEqual(len(payload["messages"]), 2)
+            post.return_value = {"answers": {"action": {"type": "choice", "choice": "walk", "probabilities": {"walk": .9, "stay": .1}}},
+                                  "usage": {"inputTokens": 42}}
+            self.assertEqual(jev.choose(state, {"walk": "Move", "stay": "Wait"}), "walk")
+            self.assertEqual(jev.calls, 1)
+            self.assertEqual(jev.input_tokens, 42)
+            self.assertEqual(jev.last["picked"], "walk")
+            self.assertEqual(jev.choose(state, {"walk": "Move", "stay": "Wait"}), "walk")
+            self.assertEqual(jev.calls, 1, "A cached choice is not another billed call")
+            self.assertEqual(post.call_args.args[2]["questions"]["action"]["type"], "choice")
+            post.return_value["answers"]["action"]["choice"] = "invented"
+            with self.assertRaises(ModelError):
+                jev.choose({**state, "changed": True}, {"walk": "Move", "stay": "Wait"})
+            healthy = deepcopy(state)
+            healthy["party"][0]["hp"] = 20
+            post.return_value = {"choices": [{"message": {"content": json.dumps(expected.to_dict())}}]}
+            with self.assertRaises(ModelError):
+                planner.plan(healthy, catalog, None)
+        self.assertNotIn("test-key", json.dumps(logs))
+
+    def test_codex_planner_uses_local_cli_and_validates_goal(self):
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        catalog = agent.catalog(state)
+        expected = DemoPlanner().plan(state, catalog, None)
+        planner = CodexPlanner(lambda *args, **kwargs: None)
+        def cli_run(args, **kwargs):
+            self.assertIn("--ignore-user-config", args)
+            self.assertIn("--ephemeral", args)
+            self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
+            self.assertEqual(args[-1], "-")
+            self.assertIn("previous_goal", kwargs["input"])
+            path = Path(args[args.index("--output-last-message") + 1])
+            path.write_text(json.dumps(expected.to_dict()))
+            return SimpleNamespace(returncode=0)
+        with patch("pokemon_red_jev.models.shutil.which", return_value="/usr/bin/codex"), \
+             patch("pokemon_red_jev.models.subprocess.run", side_effect=cli_run):
+            self.assertEqual(planner.plan(state, catalog, None), expected)
+        with patch("pokemon_red_jev.models.shutil.which", return_value=None), self.assertRaises(ValueError):
+            codex_json("test", {}, 1)
+        with patch("pokemon_red_jev.models.shutil.which", return_value="/usr/bin/codex"), \
+             patch("pokemon_red_jev.models.subprocess.run", return_value=SimpleNamespace(returncode=7)), \
+             self.assertRaisesRegex(ModelError, "exit 7"):
+            planner.plan(state, catalog, None)
+
+    def test_http_json_auth_retries_and_error_redaction(self):
+        class Response(io.BytesIO):
+            pass
+        with patch("pokemon_red_jev.models.urlopen", return_value=Response(b'{"ok":true}')) as request:
+            self.assertEqual(post_json("https://example.test/api", "secret", {"a": 1}), {"ok": True})
+            self.assertEqual(request.call_args.args[0].get_header("Authorization"), "Bearer secret")
+            self.assertEqual(json.loads(request.call_args.args[0].data), {"a": 1})
+        error = HTTPError("https://example.test", 503, "secret", {}, None)
+        with patch("pokemon_red_jev.models.urlopen", side_effect=error) as request, patch("pokemon_red_jev.models.time.sleep"):
+            with self.assertRaises(ModelError) as raised:
+                post_json("https://example.test/api", "secret", {})
+            self.assertEqual(request.call_count, 2)
+            self.assertNotIn("secret", str(raised.exception))
+        with self.assertRaises(ValueError):
+            post_json("http://example.test/api", "secret", {})
+
+    def test_pathfinding_obstacles_ledges_and_edge_exit(self):
+        grid = SimpleNamespace(w=5, h=3, tile=lambda x, y: 0, walkable=lambda x, y: 0 <= x < 5 and 0 <= y < 3,
+                               pairs=set(), ledges=[])
+        path = find_path(grid, (0, 1), lambda x, y: (x, y) == (4, 1), {(2, 1)})
+        self.assertEqual(path[-1][1:], (4, 1))
+        self.assertNotIn((2, 1), [p[1:] for p in path])
+        self.assertIsNone(find_path(grid, (0, 1), lambda x, y: x == 5))
+        self.assertEqual(find_path(grid, (0, 1), lambda x, y: x == 5, exit_ok=lambda x, y: x == 5)[-1][1], 5)
+        grid.ledges = [("right", 0, 0)]
+        self.assertEqual(find_path(grid, (0, 1), lambda x, y: (x, y) == (2, 1)), [("right", 2, 1)])
+        self.assertIsNone(find_path(grid, (0, 1), lambda x, y: (x, y) == (2, 1), {(2, 1)}))
+        wide = SimpleNamespace(w=5, h=2, tile=lambda x, y: 1 if y == 1 and x in {1, 2, 3} else 0,
+                               walkable=lambda x, y: 0 <= x < 5 and 0 <= y < 2, pairs=set(), ledges=[])
+        around = find_path(wide, (0, 1), lambda x, y: (x, y) == (4, 1), grass=lambda x, y: wide.tile(x, y) == 1, grass_cost=1)
+        self.assertNotIn((1, 1), [step[1:] for step in around])
+        self.assertEqual(around[-1][1:], (4, 1))
+
+    def test_damage_respects_immunity_and_same_type_bonus(self):
+        mon = dict(level=10, attack=20, defense=20, special=20, types=["NORMAL"])
+        move = dict(power=40, type="NORMAL")
+        self.assertEqual(damage(mon, mon, move, 0), 0)
+        self.assertGreater(damage(mon, mon, move, 1), damage({**mon, "types": []}, mon, move, 1))
+
+    def test_wram_party_bag_event_and_screen_decoding(self):
+        from pokemon_red_jev.data import Data
+        data = object.__new__(Data)
+        data.symbols = {"wPartyCount": 0xc000, "wPartyMons": 0xc100, "wPartyMonNicks": 0xc300,
+                        "wNumBagItems": 0xc400, "wBagItems": 0xc410, "wTileMap": 0xc500}
+        data.charmap = {0x80: "A", 0x81: "B", 0x7f: " ", 0xed: "▶", 0x79: "┌"}
+        game = object.__new__(Game)
+        game.data, game.memory = data, bytearray(65536)
+        game.rom = SimpleNamespace(species={1: {"name": "BULBASAUR", "types": ["GRASS", "POISON"]}},
+                                   moves={1: {"name": "TACKLE", "pp": 35}}, items={1: "POTION"})
+        game.memory[0xc000] = 1
+        game.memory[0xc100] = 1
+        game.memory[0xc101:0xc103] = bytes([1, 2])
+        game.memory[0xc122:0xc124] = bytes([1, 44])
+        game.memory[0xc121] = 12
+        game.memory[0xc104] = 8
+        game.memory[0xc108] = 1
+        game.memory[0xc11d] = 0x40 | 7
+        game.memory[0xc300:0xc303] = bytes([0x80, 0x81, 0x50])
+        game.memory[0xc400] = 1
+        game.memory[0xc410:0xc412] = bytes([1, 3])
+        p = game.party()[0]
+        self.assertEqual((p["nickname"], p["hp"], p["max_hp"], p["level"], p["status"]), ("AB", 258, 300, 12, "POISON"))
+        self.assertEqual((p["moves"][0]["pp"], p["moves"][0]["max_pp"]), (7, 42))
+        self.assertEqual(game.bag(), [{"name": "POTION", "qty": 3}])
+        game.memory[0xc500:0xc500 + 360] = bytes([0x7f] * 360)
+        game.memory[0xc500] = 0x79
+        game.memory[0xc500 + 2 * 20 + 3] = 0xed
+        game.memory[0xc500 + 14 * 20 + 2] = 0x80
+        self.assertEqual(game.screen()["cursor"], (3, 2))
+        self.assertTrue(game.screen()["box"])
+        self.assertEqual(game.screen()["dialog"].strip(), "A")
+
+    def test_low_health_replans_at_an_overworld_boundary(self):
+        agent, records = new_agent()
+        agent.step()
+        agent.game.state["party"][0]["hp"] = 1
+        agent.step()
+        self.assertEqual(agent.plans, 2)
+        self.assertTrue(any(r.get("outcome") == "party health changed" for r in records))
+
+    def test_checkpoint_roundtrip_and_atomic_failure(self):
+        agent, _ = new_agent()
+        game = agent.game
+        game.visited, game.interactions = {"ROUTE_1"}, set()
+        game.frames, game.outside_map, game.last_map = 42, 0, 0
+        loaded = []
+        game.pyboy = SimpleNamespace(save_state=lambda f: f.write(b"emulator bytes"), load_state=lambda f: loaded.append(f.read()))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.zip"
+            agent.step()
+            agent.save(path)
+            original = path.read_bytes()
+            with zipfile.ZipFile(path) as archive:
+                self.assertEqual(archive.read("emulator.state"), b"emulator bytes")
+            game.visited.clear()
+            agent.load(path)
+            self.assertEqual(game.visited, {"ROUTE_1"})
+            self.assertEqual(loaded, [b"emulator bytes"])
+            self.assertIsNone(agent.goal)
+            with patch("pokemon_red_jev.agent.os.replace", side_effect=OSError("disk failure")), self.assertRaises(OSError):
+                agent.save(path)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(len(list(Path(directory).iterdir())), 1)
+
+    def test_env_does_not_execute_or_override(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"ALREADY": "set"}):
+            path = Path(directory) / ".env"
+            path.write_text('ALREADY=changed\nNEW_TEST_ENV="$(whoami)" # comment\nEMPTY_TEST_ENV=\n')
+            load_env(path)
+            self.assertEqual(os.environ["ALREADY"], "set")
+            self.assertEqual(os.environ["NEW_TEST_ENV"], "$(whoami)")
+            self.assertEqual(os.environ["EMPTY_TEST_ENV"], "")
+
+    def test_regions_keep_warps_separate_and_edges_directed(self):
+        maps = {i: dict(id=i, name=f"MAP_{i}", objects=[], warps=[], connections=[]) for i in range(5)}
+        maps[0]["warps"] = [dict(x=2, y=0, map=1, warp=0)]
+        maps[1]["warps"] = [dict(x=0, y=0, map=99, warp=0)]
+        game = SimpleNamespace(rom=SimpleNamespace(maps=maps, spinners={3: {(2, 0): (4, 0)}}))
+        graph = Regions(game)
+        for mid in maps:
+            graph.grids[mid] = SimpleNamespace(w=5, h=1, tile=lambda x, y: 0,
+                                              walkable=lambda x, y: 0 <= x < 5 and y == 0, pairs=set(), ledges=[])
+            graph.blocked[mid] = set()
+        graph.grids[2] = SimpleNamespace(w=3, h=1, tile=lambda x, y: 1 if x == 0 else 2 if x == 1 else 0,
+                                        walkable=lambda x, y: x in {0, 2} and y == 0,
+                                        pairs=set(), ledges=[("right", 1, 2)])
+        graph.grids[4] = SimpleNamespace(w=2, h=1, tile=lambda x, y: x,
+                                        walkable=lambda x, y: x in {0, 1} and y == 0,
+                                        pairs={(0, 1), (1, 0)}, ledges=[])
+        for mid in maps:
+            graph.label(mid)
+        graph.link()
+        left, right = graph.at(0, 0, 0), graph.at(0, 4, 0)
+        self.assertNotEqual(left, right)
+        self.assertIsNone(graph.distance({left}, ("MAP_0", 4, 0)), "A warp is not a floor shortcut")
+        self.assertIsNotNone(graph.distance({left}, "MAP_1"))
+        for mid in [2, 3]:
+            left, right = graph.at(mid, 0, 0), graph.at(mid, graph.grids[mid].w - 1, 0)
+            self.assertIn(right, graph.out[left])
+            self.assertNotIn(left, graph.out.get(right, set()))
+        self.assertNotEqual(graph.at(4, 0, 0), graph.at(4, 1, 0))
+        self.assertEqual(graph.connection_point(dict(direction="right", x_align=0, y_align=-10), 20, 13), (0, 3))
+
+    def test_map_settles_after_late_destination_layout_change(self):
+        game = object.__new__(Game)
+        game.frames = 0
+        game.tick = lambda n=1: setattr(game, "frames", game.frames + n)
+        game.u8 = lambda name: (10 if game.frames < 60 else 20) if name == "wCurMapWidth" else 0
+        game.settle_map()
+        self.assertGreaterEqual(game.frames, 84)
+        self.assertLess(game.frames, 400)
+
+    def test_manual_choices_validate_input_and_quit_without_models(self):
+        state = dict(screen=[], map="OAKS_LAB", x=5, y=3, active_goal=dict(goal="Choose a starter"))
+        with patch("builtins.input", side_effect=["invalid", "2"]), patch("builtins.print"):
+            self.assertEqual(Manual().choose(state, {"a": "First", "b": "Second"}), "b")
+        with patch("builtins.input", return_value="q"), patch("builtins.print"), self.assertRaises(KeyboardInterrupt):
+            Manual().choose(state, {"a": "First", "b": "Second"})
+
+    def test_controls_wait_for_menu_input_and_expose_safari_choices(self):
+        screen = dict(rows=[" " * 20] * 18, cursor=(2, 2), waiting=False)
+        game = SimpleNamespace(settle_screen=lambda: None, screen=lambda: screen, menu_ready=lambda: False)
+        self.assertEqual(Controls(game).actions({"mode": "dialog"})[0].kind, "wait")
+        actions = Controls(game).battle_actions(dict(battle=dict(safari=True, safari_balls=12)))
+        self.assertEqual({a.target["label"] for a in actions}, {"BALL", "BAIT", "THROW ROCK", "RUN"})
+
+    def test_switch_press_reconnects_a_blocked_route(self):
+        room, goal = (0, 0), (1, 0)
+        current, flipped = {room: set()}, {room: {goal}, goal: set()}
+        with_press, _ = switch_distances(current, flipped, [(room, room)], set(), {goal})
+        without_press, _ = switch_distances(current, flipped, [], set(), {goal})
+        self.assertEqual(with_press[room], 2)
+        self.assertNotIn(room, without_press)
+        self.assertIn("leads toward the objective", switch_fact(None, 2))
+        self.assertIn("does not bring it closer", switch_fact(1, 4))
+        maps = {0: dict(name="POKEMON_MANSION_1F", objects=[], warps=[], connections=[]),
+                1: dict(name="GOAL", objects=[], warps=[], connections=[])}
+        game = SimpleNamespace(rom=SimpleNamespace(maps=maps, spinners={}, hidden={
+            0: [dict(fn="Mansion1FSwitches", x=1, y=1)]}))
+        graph = Regions(game)
+        graph.cells[0] = {(1, 2): room}
+        graph.out[room] = set()
+        graph.flip = Regions(game)
+        graph.flip.cells[0] = {(1, 2): (0, 1)}
+        graph.flip.cells[1] = {(0, 0): goal}
+        graph.flip.out[(0, 1)] = {goal}
+        graph.flip.out[goal] = set()
+        graph.live_key, graph.signature = None, (False, False, False)
+        distances, _ = graph.mansion_distances("GOAL")
+        self.assertEqual(distances[room], 2)
+        reached, other = switch_reach(current, flipped, [(room, room)], {room})
+        self.assertEqual(other[goal], 2)
+        self.assertNotIn(goal, switch_reach(current, flipped, [], {room})[1])
+        self.assertEqual(reached[room], 0)
+
+    def test_pc_summary_lists_the_box_without_choosing(self):
+        full = pc_summary({"party": [{}] * 6, "box": [{"species": "PIDGEY", "level": 12}]})
+        self.assertIn("Party 6/6", full)
+        self.assertIn("PIDGEY Lv12", full)
+        self.assertIn("deposit someone before withdrawing", full)
+        self.assertIn("has to stay out", pc_summary({"party": [{"species": "ABRA", "level": 8}], "box": []}))
+        self.assertNotIn("deposit", pc_summary({"party": [{}, {}], "box": [{"species": "RATTATA", "level": 4}]}).split("Box:")[0])
+
+    def test_strength_plans_switch_pushes_and_requires_the_badge(self):
+        class Floor:
+            def __init__(self, w, h):
+                self.w, self.h, self.pairs, self.ledges = w, h, set(), []
+
+            def tile(self, x, y):
+                return 0 if 0 <= x < self.w and 0 <= y < self.h else -1
+
+            def walkable(self, x, y):
+                return self.tile(x, y) == 0
+
+        boulder = [{"index": 7, "x": 2, "y": 1}]
+        switch = [{"x": 4, "y": 1, "kind": "switch"}]
+        wide = Floor(5, 3)
+        actions = boulder_actions(wide, (1, 1), boulder, {(2, 1)}, [], switch,
+                                  known={"STRENGTH"}, badges=0x08, strength_on=True)
+        self.assertEqual([item[0] for item in actions], ["push:7:right"])
+        self.assertIn("Leads toward the objective", actions[0][1])
+        self.assertEqual(boulder_actions(wide, (1, 1), boulder, {(2, 1)}, [], switch,
+                                         known={"STRENGTH"}, badges=0x02, strength_on=True), [])
+        hole = boulder_actions(Floor(4, 1), (0, 0), [{"index": 1, "x": 1, "y": 0}], {(1, 0)}, [],
+                               [{"x": 2, "y": 0, "kind": "hole"}], known={"STRENGTH"}, badges=0x08, strength_on=True)
+        self.assertIn("hole in the floor", hole[0][1])
+        self.assertIn("puts the boulder on it", hole[0][1])
+        inactive = boulder_actions(wide, (1, 1), boulder, {(2, 1)}, [], switch,
+                                   known={"STRENGTH"}, badges=0x08, strength_on=False)
+        self.assertEqual(inactive[0][0], "field:STRENGTH")
+        self.assertIn("floor switch", inactive[0][1])
+        line, on_mat = Floor(3, 1), [{"index": 1, "x": 1, "y": 0}]
+        mat_target, mat_blocked = [{"x": 2, "y": 0, "kind": "switch"}], {(1, 0), (0, 0)}
+        self.assertEqual(boulder_actions(line, (0, 0), on_mat, mat_blocked, [], mat_target,
+                                         known={"STRENGTH"}, badges=0x08, strength_on=True), [])
+        from_mat = boulder_actions(line, (0, 0), on_mat, mat_blocked, [], mat_target, edge_mats={(0, 0)},
+                                   known={"STRENGTH"}, badges=0x08, strength_on=True)
+        self.assertIn("push:1:right", [item[0] for item in from_mat])
+
+    def test_field_supplies_and_blocked_exit_memory(self):
+        party = [dict(nickname="JEV", species="BULBASAUR", hp=10, max_hp=20, status="OK", level=5, moves=[])]
+        bag = [{"name": "POKé FLUTE", "qty": 1}, {"name": "HM01", "qty": 1}, {"name": "POTION", "qty": 1}]
+
+        def machine(name, team):
+            return "Teaches CUT." if name == "HM01" else None
+
+        offered = {key for key, _, _ in supply_actions(
+            dict(bag=bag, party=party), snorlax=True, surfing=False, machine_text=machine,
+            is_key=lambda name: name.startswith("HM"), unused={})}
+        self.assertEqual(offered, {"item:POKé FLUTE", "item:HM01", "item:POTION"})
+        healthy = [dict(party[0], hp=20)]
+        quiet = {key for key, _, _ in supply_actions(
+            dict(bag=bag, party=healthy), snorlax=False, surfing=False, machine_text=machine,
+            is_key=lambda name: name.startswith("HM"), unused={})}
+        self.assertEqual(quiet, {"item:HM01"})
+        full = [{"name": "HM01", "qty": 1}] + [{"name": f"ITEM{i}", "qty": 1} for i in range(19)]
+        toss = next(text for key, text, _ in supply_actions(
+            dict(bag=full, party=healthy), snorlax=False, surfing=False, machine_text=machine,
+            is_key=lambda name: name.startswith("HM"), unused={}) if key == "toss")
+        self.assertNotIn("HM01", toss)
+        self.assertIn("ITEM0", toss)
+        memory = RouteMemory()
+        base = {"badges": 0, "milestone": {"id": "parcel"}, "bag": []}
+        memory.sync(base)
+        for _ in range(2):
+            memory.note_exit("ROUTE_1", "exit:up", ["0:1>1:0"], False)
+        self.assertIn("0:1>1:0", memory.skip())
+        self.assertIn("did not get through", memory.failure_note("ROUTE_1", "exit:up"))
+        memory.note_exit("ROUTE_1", "exit:up", ["0:1>1:0"], True)
+        self.assertEqual(memory.blocked_exits, {})
+        for _ in range(5):
+            memory.note_exit("ROUTE_1", "door:0", [], False)
+        self.assertTrue(memory.hidden("ROUTE_1", "door:0"))
+        memory.sync({"badges": 1, "milestone": {"id": "parcel"}, "bag": []})
+        self.assertEqual(memory.blocked_exits, {})
+        offered = {key for key, _, _ in supply_actions(
+            dict(bag=[{"name": "MOON STONE", "qty": 1}, {"name": "REPEL", "qty": 1}], party=party),
+            snorlax=False, surfing=False, machine_text=machine, is_key=lambda name: False, unused={},
+            stone_text=lambda name, team: "Evolves CLEFAIRY." if name == "MOON STONE" else "")}
+        self.assertEqual(offered, {"item:MOON STONE", "item:REPEL"})
+        self.assertIn("Evolves CLEFAIRY", next(text for key, text, _ in supply_actions(
+            dict(bag=[{"name": "MOON STONE", "qty": 1}], party=party), snorlax=False, surfing=False,
+            machine_text=machine, is_key=lambda name: False, unused={},
+            stone_text=lambda name, team: "Evolves CLEFAIRY.") if key == "item:MOON STONE"))
+
+    def test_failed_exit_is_recorded_for_the_next_choice(self):
+        from pokemon_red_jev.navigation import Action
+        agent, _ = new_agent()
+        agent.navigation.memory = RouteMemory()
+        agent.navigation.actions = lambda state, goal: [Action("exit:up", "Leave north", "walk", target={"edges": ["0:1>1:0"]})]
+        agent.navigation.execute = lambda action: None
+        agent.jev.choose = lambda state, options: "exit:up"
+        agent.step()
+        self.assertEqual(agent.navigation.memory.blocked_exits["ROUTE_1:exit:up"], 1)
+        self.assertEqual(agent.navigation.memory.blocked_edges["0:1>1:0"], 1)
+
+    def test_dialogue_is_kept_and_shown_on_the_same_interaction(self):
+        memory = RouteMemory()
+        memory.begin("VIRIDIAN_MART:npc:1")
+        memory.hear("Hello")
+        memory.hear("Hello there")
+        memory.hear("Hello there")
+        memory.hear("Come again")
+        memory.close()
+        self.assertEqual(memory.said["VIRIDIAN_MART:npc:1"], "Hello there Come again")
+        self.assertIn('Last time they said: "Hello there Come again".', memory.talk_fact("VIRIDIAN_MART", "npc:1", "npc"))
+        memory.said["VERMILION_GYM:hidden:1"] = "This can is empty"
+        memory.begin("VERMILION_GYM:hidden:2")
+        memory.hear("The electric locks were reset")
+        self.assertNotIn("VERMILION_GYM:hidden:1", memory.said)
+        memory.forget_trash("VERMILION_GYM", [2])
+        memory.begin("VERMILION_GYM:hidden:2")
+        memory.hear("A switch under this can")
+        memory.forget_trash("VERMILION_GYM", [2])
+        self.assertIn("A switch under this can", memory.said["VERMILION_GYM:hidden:2"])
+        memory.forget_trash("ROUTE_6", [])
+        memory.forget_trash("VERMILION_GYM", [2])
+        self.assertNotIn("VERMILION_GYM:hidden:2", memory.said)
+        memory.said["ROUTE_1:exit:up:blocked"] = "You need a drink"
+        self.assertIn("You need a drink", memory.stopped_note("ROUTE_1", "exit:up"))
+        memory.sync({"badges": 0, "milestone": {"id": "parcel"}, "bag": []})
+        memory.remember_pushback("ROUTE_1", [("up", 1, 1), ("up", 1, 2)], 1, 1, (9, 9))
+        self.assertEqual(memory.trap_points("ROUTE_1"), {(1, 2)})
+        memory.remember_pushback("ROUTE_1", [("up", 1, 1), ("up", 1, 2)], 1, 1, (9, 9))
+        self.assertEqual(len(memory.traps["ROUTE_1"]), 1)
+        memory.sync({"badges": 2, "milestone": {"id": "brock"}, "bag": []})
+        self.assertEqual(memory.traps, {})
+        party = [dict(nickname="JEV", species="ODDISH", moves=[dict(name="CUT")]),
+                 dict(nickname="BLUE", species="PIDGEY", moves=[])]
+        self.assertIn("no other team member knows it", menu_note(["Deposit"], "JEV", {"party": party}, "DEPOSIT"))
+        self.assertIn("all gates in this building flip", menu_note(["Press it?"], "YES", {}))
+        self.assertIn("frees a bag slot", menu_note(["Is it OK to toss POTION?"], "YES", {"bag": [{}] * 20}))
+        self.assertIn("Pick one of the current moves to forget", menu_note(["move to make room for GUST?"], "YES", {}))
+        self.assertIn("Lights up a dark cave", menu_note(["FLASH"], "FLASH", {}))
+
+    def test_menu_guards_leave_a_dead_end_screen(self):
+        self.assertTrue(move_list_open(["TACKLE", "TYPE/NORMAL"]))
+        self.assertFalse(move_list_open(["FIGHT  PKMN  ITEM  RUN"]))
+        rows = ["JEV", "NOT ABLE", "BLUE", "NOT ABLE"]
+        self.assertTrue(party_unusable(rows, 2))
+        self.assertFalse(party_unusable(["JEV", "ABLE", "BLUE", "NOT ABLE"], 2))
+        seen, progress, screen = None, ("MART",), ("YES", "NO")
+        for _ in range(4):
+            seen, leave = note_menu(seen, screen, progress)
+            self.assertFalse(leave)
+        seen, leave = note_menu(seen, screen, progress)
+        self.assertTrue(leave)
+        seen, leave = note_menu(seen, screen, ("MART", "potion"))
+        self.assertFalse(leave)
+
+    def test_dialog_step_records_the_line_for_the_open_conversation(self):
+        agent, _ = new_agent()
+        agent.navigation.memory = RouteMemory()
+        agent.navigation.memory.begin("ROUTE_1:npc:1")
+        agent.game.screen = lambda: {"dialog": "OAK: Hello there"}
+        agent.game.state["mode"] = "dialog"
+        agent._remember_dialogue(agent.game.snapshot())
+        self.assertEqual(agent.navigation.memory.said["ROUTE_1:npc:1"], "OAK: Hello there")
+        agent.game.state["mode"] = "overworld"
+        agent._remember_dialogue(agent.game.snapshot())
+        self.assertIsNone(agent.navigation.memory.pending)
+        self.assertIn("Hello there", agent.navigation.memory.said["ROUTE_1:npc:1"])
+
+    def test_shop_price_and_elevator_floor_are_facts(self):
+        rows = ["POKé MART", "POTION <ED>300", "BUY  SELL  QUIT"]
+        bag = [{"name": "POTION", "qty": 2}]
+        note = shop_note(rows, "POTION", bag)
+        self.assertIn("Costs ¥300", note)
+        self.assertIn("Heals 20 HP", note)
+        self.assertIn("You have 2", note)
+        self.assertEqual(shop_note(["HELLO"], "YES", []), "")
+        self.assertIn("Leads toward the objective", floor_phrase("CELADON_MART_3F", 1, 4))
+        self.assertIn("Leads away from the objective", floor_phrase("CELADON_MART_1F", 6, 2))
+        self.assertNotIn("area", floor_phrase("CELADON_MART_5F", None, 2))
+
+    def test_battle_facts_cover_catch_chance_hit_stages_and_a_likely_ko(self):
+        self.assertEqual(catch_chance("MASTER BALL", 1, 50, 50, "OK"), 1)
+        asleep = catch_chance("POKé BALL", 255, 1, 40, "SLEEP")
+        healthy = catch_chance("POKé BALL", 255, 40, 40, "OK")
+        self.assertGreater(asleep, healthy)
+        self.assertIsNone(hit_chance(100, 7, 7))
+        self.assertEqual(hit_chance(100, 13, 7), 100)
+        self.assertLess(hit_chance(100, 7, 13), 100)
+        player = dict(level=20, attack=40, defense=20, special=20, types=["WATER"])
+        enemy = dict(level=5, attack=10, defense=10, special=10, types=["FIRE"], hp=4, max_hp=20,
+                     status="OK", species="CHARMANDER", catch_rate=45, dex=4)
+        move = dict(name="BUBBLE", type="WATER", power=20, pp=30, accuracy=100, slot=0)
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=lambda attack, defense: 2),
+                               u8=lambda name: 1 if name == "wPlayerMonAccuracyMod" else 7,
+                               owned=lambda dex: False)
+        controls = Controls(game)
+        state = dict(map="ROUTE_1", mode="battle", party=[dict(nickname="JEV", species="SQUIRTLE", level=8, hp=20,
+                     max_hp=20, types=["WATER"], slot=0)], bag=[{"name": "POKé BALL", "qty": 3}],
+                     battle=dict(kind="wild", player=dict(player, hp=20, max_hp=30, status="OK", slot=0),
+                                 enemy=enemy, active_slot=0, moves=[move], safari=False))
+        text = next(a.description for a in controls.battle_actions(state) if a.key == "move:0")
+        ball = next(a.description for a in controls.battle_actions(state) if a.key.startswith("ball:"))
+        self.assertIn("Likely KO", text)
+        self.assertIn("Hit chance right now", text)
+        self.assertIn("Estimated catch chance", ball)
+        self.assertIn("NEW species", ball)
+        self.assertIn("not on your team", ball)
+
+    def test_three_failures_stay_available_and_another_option_is_tried(self):
+        self.assertEqual(alternate("exit:up", {"exit:up": "North", "exit:down": "South"}, {}, "here",
+                                   {"exit:up": 0.9, "exit:down": 0.1}), "exit:up")
+        self.assertEqual(alternate("exit:up", {"exit:up": "North", "exit:down": "South"}, {"here:exit:up": 3}, "here",
+                                   {"exit:up": 0.9, "exit:down": 0.1}), "exit:down")
+        agent, records = new_agent()
+        agent.navigation.memory = RouteMemory()
+        agent.navigation.actions = lambda state, goal: [
+            Action("exit:up", "Leave north", "walk", target={"edges": []}),
+            Action("exit:down", "Leave south", "walk", target={"edges": []})]
+        agent.navigation.execute = lambda action: None
+        agent.failures["ROUTE_1:0,0:overworld:exit:up"] = 3
+
+        def choose(state, options):
+            self.assertIn("exit:up", options)
+            self.assertIn("Failed without state change here 3 times", options["exit:up"])
+            agent.jev.last = {"picked": "exit:up", "probabilities": {"exit:up": 0.9, "exit:down": 0.1}}
+            return "exit:up"
+
+        agent.jev.choose = choose
+        agent.step()
+        self.assertEqual(agent.history[-1]["action"], "exit:down")
+        self.assertTrue(any(r["kind"] == "retry" for r in records))
+
+
+if __name__ == "__main__":
+    unittest.main()

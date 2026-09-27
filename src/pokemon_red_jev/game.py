@@ -36,7 +36,9 @@ class Rom:
             self.species[i] = dict(id=i, dex=dex, name=data.decode(self.b[sym("MonsterNames") + (i - 1) * 10:][:10]),
                                   types=list(dict.fromkeys(TYPES.get(t, "?") for t in self.b[a + 6:a + 8])),
                                   catch_rate=self.b[a + 8], machines=list(self.b[a + 20:a + 27]),
-                                  stones=self._stone_items(i))
+                                  evolutions=self._evolutions(i))
+        for species in self.species.values():
+            species["stones"] = [e["item"] for e in species["evolutions"] if e["method"] == "item"]
         self.type_chart = {}
         for a in range(sym("TypeEffects"), len(self.b) - 2, 3):
             if self.b[a] == 0xff:
@@ -118,28 +120,30 @@ class Rom:
                 self.spinners[mid][x, y] = (tx, ty)
                 a += 4
 
-    def _stone_items(self, species_id):
-        """Evolution-stone item ids that evolve this species, from EvosMovesPointerTable."""
+    def _evolutions(self, species_id):
+        """Evolution requirements and destination species from EvosMovesPointerTable."""
         try:
             table = self.data.sym("EvosMovesPointerTable")
         except KeyError:
             return []
         addr = self.flat(table // 0x4000, self.u16(table + (species_id - 1) * 2))
-        stones = []
+        evolutions = []
         for _ in range(8):
             if addr >= len(self.b) or self.b[addr] == 0:
                 break
             method = self.b[addr]
             if method == 1:
+                evolutions.append(dict(method="level", level=self.b[addr + 1], into=self.b[addr + 2]))
                 addr += 3
             elif method == 2:
-                stones.append(self.b[addr + 1])
+                evolutions.append(dict(method="item", item=self.b[addr + 1], into=self.b[addr + 3]))
                 addr += 4
             elif method == 3:
+                evolutions.append(dict(method="trade", into=self.b[addr + 2]))
                 addr += 3
             else:
                 break
-        return stones
+        return evolutions
 
     def machine(self, item):
         index = item - 0xc9 if item >= 0xc9 else 50 + item - 0xc4 if item >= 0xc4 else -1
@@ -276,12 +280,21 @@ class Game:
     def menu_ready(self):
         lo, hi = self.data.sym("HandleMenuInput"), self.data.sym("PlaceMenuCursor")
         for _ in range(4):
-            sp = self.pyboy.register_file.SP
-            for a in range(sp, min(sp + 24, 0xffff), 2):
-                ret = self.memory[a] | self.memory[a + 1] << 8
-                if lo <= ret < hi:
-                    return True
+            if self._return_in(lo, hi):
+                return True
             self.tick()
+        return False
+
+    def in_routine(self, start, end):
+        """True when a return address on the stack is inside this routine. Does not advance frames."""
+        return self._return_in(self.data.sym(start), self.data.sym(end))
+
+    def _return_in(self, lo, hi):
+        sp = self.pyboy.register_file.SP
+        for a in range(sp, min(sp + 24, 0xffff), 2):
+            ret = self.memory[a] | self.memory[a + 1] << 8
+            if lo <= ret < hi:
+                return True
         return False
 
     def settle_map(self):

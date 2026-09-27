@@ -166,18 +166,39 @@ def damage(player, enemy, move, effectiveness):
 class Controls:
     def __init__(self, game):
         self.game = game
+        self._menu_wait = None
 
     def find(self, label):
         screen = self.game.screen()
         hits = []
+        want = label.upper()
         for y, cells in enumerate(screen["cells"]):
             row = "".join(cells).upper()
-            index = row.find(label.upper())
+            index = self._item_at(row, want)
             if index >= 0:
                 columns = [x for x, cell in enumerate(cells) for _ in cell]
                 hits.append((columns[index], y))
         cur = screen["cursor"] or (0, 17)
         return min(hits, key=lambda p: abs(p[1] - cur[1]) * 4 + abs(p[0] - cur[0])) if hits else None
+
+    @staticmethod
+    def _item_at(row, label):
+        """Match the whole item. REVIVE is not the REVIVE inside MAX REVIVE."""
+        longer = {"MAX", "SUPER", "HYPER", "FULL", "GREAT", "ULTRA"}
+        start = 0
+        while True:
+            index = row.find(label, start)
+            if index < 0:
+                return -1
+            if index > 1 and row[index - 1] == " " and row[index - 2] != " ":
+                end = index - 1
+                begin = end
+                while begin > 0 and row[begin - 1].isalpha():
+                    begin -= 1
+                if row[begin:end] in longer:
+                    start = index + 1
+                    continue
+            return index
 
     def select(self, label, index=None):
         g = self.game
@@ -287,8 +308,19 @@ class Controls:
             if typed:
                 choices.append(Action("name:done", f"Finish the name {typed!r}.", "button", target={"button": "start"}))
             return choices
+        # Options has its own joypad loop, outside HandleMenuInput, so menu_ready never becomes true there.
+        if self._options_open(rows):
+            self._menu_wait = None
+            return [Action("options", "Set text speed to FAST, battle animations OFF, then close Options.", "options")]
         if screen["cursor"] and not screen["waiting"] and not g.menu_ready():
+            plain = tuple(row.replace("▶", " ").replace("▷", " ") for row in screen["rows"])
+            self._menu_wait, stuck = note_menu(self._menu_wait, plain, None, limit=40)
+            if stuck:
+                return [Action("cancel", "Back out of a menu that is no longer accepting input.", "button", target={"button": "b"})]
             return [Action("wait", "Wait for the menu to accept input.", "wait")]
+        self._menu_wait = None
+        if "NEW GAME" in rows and "OPTION" in rows and g.u8("wOptions") & 0x8f != 0x81:
+            return [Action("options:open", "Open Options to set fast text and turn battle animations off.", "menu", target={"label": "OPTION"})]
         if state["mode"] == "battle" and screen["cursor"] and self.find("RUN") and (self.find("FIGHT") or state["battle"].get("safari")):
             return self.battle_actions(state)
         if screen["waiting"] or not screen["cursor"]:
@@ -363,9 +395,11 @@ class Controls:
                      ("THROW ROCK", "Throw a rock: improves catching and increases fleeing."),
                      ("RUN", "Leave this Safari encounter.")]]
         accuracy_stage = evasion_stage = 7
+        screens = 0
         if hasattr(self.game, "u8"):
             accuracy_stage = self.game.u8("wPlayerMonAccuracyMod")
             evasion_stage = self.game.u8("wEnemyMonEvasionMod")
+            screens = self.game.u8("wPlayerBattleStatus3")
         for move in b["moves"]:
             if not move["pp"]:
                 continue
@@ -392,10 +426,16 @@ class Controls:
                 desc += f" Rough damage {low}-{high}.{effect} Ignores critical hits and special effects. Enemy HP {hp}."
             else:
                 desc += " Status move (no direct damage)."
+                if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
+                    desc += " Already in effect: using it again does nothing."
             options.append(Action(f"move:{move['slot']}", desc, "battle_move", target=move))
         for p in state["party"]:
             if p["hp"] and p["slot"] != b["active_slot"]:
-                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, HP {p['hp']}/{p['max_hp']}). Uses a turn.", "switch", target=p))
+                attacks = [m for m in p["moves"] if m["power"] and m["pp"]]
+                best = max((self.game.rom.effectiveness(m["type"], b["enemy"]["types"]) for m in attacks), default=None)
+                threat = max((self.game.rom.effectiveness(t, p["types"]) for t in b["enemy"]["types"]), default=1)
+                offense = f"Best usable damaging move type multiplier {best} against the enemy." if best is not None else "No damaging moves with PP remaining."
+                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, {'/'.join(p['types'])}, HP {p['hp']}/{p['max_hp']}). {offense} Enemy type attacks have a maximum type multiplier of {threat} against it. Uses a turn.", "switch", target=p))
         for item in state["bag"]:
             if item["name"] in HEAL and b["player"]["hp"] < b["player"]["max_hp"]:
                 options.append(Action(f"item:{item['name']}", f"Use {item['name']} to heal up to {HEAL[item['name']]} HP. Quantity {item['qty']}. Uses a turn.", "battle_item", target={"name": item["name"], "slot": b["active_slot"]}))
@@ -409,14 +449,24 @@ class Controls:
             if item["name"] in {"REVIVE", "MAX REVIVE"}:
                 for p in state["party"]:
                     if not p["hp"]:
-                        options.append(Action(f"revive:{p['slot']}", f"Use {item['name']} on fainted {p['nickname']}. Uses a turn.", "battle_item", target={"name": item["name"], "slot": p["slot"]}))
+                        options.append(Action(f"revive:{item['name']}:{p['slot']}", f"Use {item['name']} on fainted {p['nickname']}, restoring {'full' if item['name'] == 'MAX REVIVE' else 'half'} HP. Uses a turn.", "battle_item", target={"name": item["name"], "slot": p["slot"]}))
         if b["kind"] == "wild":
             options.append(Action("run", "Attempt to escape this wild battle.", "menu", target={"label": "RUN"}))
             if state["map"].startswith("POKEMON_TOWER_") and "SILPH SCOPE" not in {i["name"] for i in state["bag"]}:
                 return [Action("run", "Flee the unidentified ghost. Without the Silph Scope the party cannot fight it and it dodges balls.", "menu", target={"label": "RUN"})]
-        if not options:
+        # Struggle depends on remaining PP. Switching, items, or running do not replace it.
+        if not any(move["pp"] for move in b["moves"]):
             options.append(Action("struggle", "Fight with no PP remaining; the game uses STRUGGLE.", "menu", target={"label": "FIGHT"}))
         return options
+
+    def _options_open(self, rows):
+        if "TEXT SPEED" in rows and "BATTLE" in rows:
+            return True
+        probe = getattr(self.game, "in_routine", None)
+        try:
+            return bool(probe and probe("DisplayOptionMenu", "TextSpeedOptionData"))
+        except (KeyError, AttributeError):
+            return False
 
     def _catch_text(self, state, battle, item):
         enemy, party = battle["enemy"], state["party"]
@@ -441,6 +491,18 @@ class Controls:
         g, t = self.game, action.target
         if action.kind == "button":
             g.press(t["button"], 4, 45)
+        elif action.kind == "options":
+            g.tick(30)
+            for _ in range(4):
+                if g.u8("wTopMenuItemY") == 3:
+                    break
+                g.press("up", settle=10)
+            for _ in range(2):
+                g.press("left", settle=10)
+            if not g.u8("wOptions") & 0x80:
+                g.press("down", settle=10)
+                g.press("right", settle=10)
+            g.press("b", settle=40)
         elif action.kind == "wait":
             g.tick(12)
         elif action.kind == "menu":

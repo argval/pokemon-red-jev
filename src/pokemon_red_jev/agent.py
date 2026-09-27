@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 
 from .controls import move_list_open, note_menu, party_unusable
-from .goals import fallback_goal
+from .goals import Goal, fallback_goal
 from .models import ModelError
 
 
@@ -54,6 +54,103 @@ class Agent:
         self.replan_reason = "startup"
         self.started_healthy = False
         self.menu_seen = None
+        self.observed = None
+        self.pending_item = None
+        self.item_fresh = False
+        self.losses = {}
+        self.wiped_now = False
+
+    @staticmethod
+    def team_key(state):
+        party = state.get("party") or []
+        return {"lineup": sorted(p["species"] for p in party),
+                "levels": sum(p["level"] for p in party),
+                "moves": sorted(m["name"] for p in party for m in p.get("moves", []))}
+
+    def _observe(self, state):
+        """Observe changes even when a menu guard or a busy frame performed the action."""
+        party = state.get("party") or []
+        wiped = bool(state.get("in_battle", state["mode"] == "battle") and party and
+                     all(p["hp"] == 0 for p in party))
+        if wiped and not self.wiped_now:
+            previous = self.losses.get(state["map"], {})
+            self.losses[state["map"]] = {"count": previous.get("count", 0) + 1, **self.team_key(state)}
+        self.wiped_now = wiped
+        # Opening the menu is not a use. Judge the session only after it has closed.
+        if self.pending_item and state["mode"] == "overworld" and not self.item_fresh:
+            self.navigation.memory.note_supply(self.pending_item["name"],
+                                               self.pending_item["before"] != self.supply_key(state))
+            self.pending_item = None
+        useful = self.observed is not None and self.progress_key(state) != self.progress_key(self.observed)
+        if self.goal and (useful or self.goal.done(state)):
+            self.no_progress = 0
+        self.observed = state
+        return useful
+
+    def progress_key(self, state):
+        result = {k: state.get(k) for k in ("events", "bag", "badges", "box")}
+        result["team"] = self.team_key(state)
+        result["experience"] = sum(p.get("experience", 0) for p in state.get("party") or [])
+        if self.goal and self.goal.focus in {"heal", "train", "catch", "team"}:
+            result["party"] = state.get("party")
+        return json.dumps(result, sort_keys=True)
+
+    @staticmethod
+    def supply_key(state):
+        """Bag quantities and party vitals. Position and the open menu are not a use."""
+        bag = ",".join(f"{item['name']}{item['qty']}" for item in state.get("bag") or [])
+        party = ",".join(
+            f"{mon.get('level')}{'+'.join(move.get('name', '') for move in mon.get('moves') or [])}"
+            f"{mon.get('hp')}{mon.get('status')}"
+            for mon in state.get("party") or [])
+        return f"{bag}|{party}"
+
+    def _recovery(self, state):
+        state["losses"] = self.losses
+        team = self.team_key(state)
+        for place, loss in self.losses.items():
+            if (loss["count"] >= 2 and team["lineup"] == loss["lineup"] and
+                    team["levels"] - loss["levels"] < 5 and team["moves"] == loss["moves"]):
+                state["recovery"] = {"map": place, "losses": loss["count"],
+                                     "allowed_focuses": ["heal", "train", "catch", "shop", "explore", "team"],
+                                     "reason": "The unchanged team lost here repeatedly. Change the lineup, learn a move, "
+                                               "or gain five levels across the party before resuming progress."}
+                return True
+        return False
+
+    def _recovery_goal(self, state):
+        routes = [(self.navigation.hops(state["map_id"], m["name"]), m["name"])
+                  for m in self.game.rom.maps.values() if m["name"].startswith("ROUTE_")]
+        reachable = [(distance, name) for distance, name in routes if distance is not None]
+        target = min(reachable)[1] if reachable else state["map"]
+        level = max((p["level"] for p in state["party"]), default=1)
+        return Goal("Train the party before retrying the fight that defeated it", "train", target,
+                    {"kind": "level", "value": min(100, level + 5)}, 20)
+
+    def _exit_cleared(self, state, after, action):
+        if after["map"] != state["map"]:
+            return True
+        target = action.target or {}
+        regions = getattr(self.navigation, "regions", None)
+        # A teleport pad stays on this map. It worked when we left the starting area.
+        if action.key.startswith("door:") and target.get("map") == state.get("map_id") and regions is not None:
+            if (after["x"], after["y"]) == (state["x"], state["y"]):
+                return False
+            origin = regions.at(state["map_id"], state["x"], state["y"])
+            arrived = regions.at(after["map_id"], after["x"], after["y"])
+            pad = target.get("x"), target.get("y")
+            far = None not in pad and abs(after["x"] - pad[0]) + abs(after["y"] - pad[1]) > 1
+            return bool(far and arrived is not None and arrived != origin)
+        if not regions or (after["x"], after["y"]) == (state["x"], state["y"]):
+            return False
+        arrived = regions.at(after["map_id"], after["x"], after["y"])
+        source = regions.landing(regions.at(state["map_id"], state["x"], state["y"]))
+        for edge in action.target.get("edges", []):
+            destination = tuple(map(int, edge.split(">")[1].split(":")))
+            landing = regions.landing(destination)
+            if arrived == destination or arrived in landing - source:
+                return True
+        return False
 
     def catalog(self, state):
         maps = [m["name"] for m in self.game.rom.maps.values()]
@@ -121,6 +218,8 @@ class Agent:
 
     def step(self):
         state = self.game.snapshot()
+        self._observe(state)
+        recovering = self._recovery(state)
         self._remember_dialogue(state)
         if self.goal:
             state["active_goal"] = self.goal.to_dict()
@@ -136,9 +235,11 @@ class Agent:
                 self.finish_goal("story changed")
             elif state["mode"] == "overworld" and self.started_healthy and hp_fraction < .25:
                 self.finish_goal("party health changed")
-            elif self.goal_decisions >= self.goal.max_decisions:
+            elif state["mode"] == "overworld" and recovering and self.goal.focus == "progress":
+                self.finish_goal("repeated team losses")
+            elif state["mode"] == "overworld" and self.goal_decisions >= self.goal.max_decisions:
                 self.finish_goal("decision budget exhausted")
-            elif self.no_progress >= 8:
+            elif state["mode"] == "overworld" and self.no_progress >= 8:
                 self.finish_goal("stalled")
         if state["mode"] == "busy":
             self.game.tick(8)
@@ -159,6 +260,8 @@ class Agent:
                     self.goal = fallback_goal(state)
             else:
                 self.goal = fallback_goal(state)
+            if recovering and self.goal.focus == "progress":
+                self.goal = self._recovery_goal(state)
             self.goal_decisions = self.no_progress = 0
             self.best_distance = self.navigation.hops(state["map_id"], self.goal.target_map)
             self.milestone_id = milestone_id
@@ -172,7 +275,7 @@ class Agent:
             return
         if not actions:
             self.log("no_actions", map=state["map"], mode=state["mode"])
-            self.no_progress += 1
+            self.no_progress += state["mode"] == "overworld"
             self.game.tick(12)
             return
         location = f"{state['map']}:{state['x']},{state['y']}:{state['mode']}"
@@ -193,6 +296,9 @@ class Agent:
             self._show(state)
         action = next(a for a in actions if a.key == choice)
         self.log("action", map=state["map"], choice=choice, description=action.description)
+        if state["mode"] == "overworld" and action.kind in {"item", "toss"} and hasattr(self.navigation, "memory"):
+            self.pending_item = {"name": action.target.get("name", "BAG"), "before": self.supply_key(state)}
+            self.item_fresh = True
         if action.kind == "field":
             if self.navigation.execute(action):
                 self.controls.execute(action)
@@ -201,6 +307,8 @@ class Agent:
         else:
             self.controls.execute(action)
         after = self.game.snapshot()
+        useful = self._observe(after)
+        self.item_fresh = False
         if after["mode"] == "overworld":
             self.navigation.update(after)
         changed = self.change_key(state) != self.change_key(after)
@@ -212,14 +320,12 @@ class Agent:
         memory = getattr(self.navigation, "memory", None)
         if memory and state["mode"] == "overworld":
             if action.key.startswith(("door:", "exit:")) and after["mode"] == "overworld":
-                memory.note_exit(state["map"], action.key, action.target.get("edges") or [], after["map"] != state["map"])
+                memory.note_exit(state["map"], action.key, action.target.get("edges") or [], self._exit_cleared(state, after, action))
             if after["mode"] == "dialog" and action.kind in {"walk", "door"} and not memory.pending:
                 memory.begin(f"{state['map']}:{action.key}:blocked")
             if after["mode"] == "dialog" and action.path and after.get("map") == state["map"]:
                 goal_square = (action.target.get("x"), action.target.get("y")) if action.target.get("x") is not None else None
                 memory.remember_pushback(state["map"], action.path, after["x"], after["y"], goal_square)
-            if action.kind in {"item", "toss"}:
-                memory.note_supply(action.target.get("name", "BAG"), changed)
             if action.target.get("switch") and changed:
                 memory.switch_pressed = state["map"]
         if memory:
@@ -241,10 +347,11 @@ class Agent:
             closer = distance is not None and (self.best_distance is None or distance < self.best_distance)
             if closer:
                 self.best_distance = distance
-            useful = closer or state["events"] != after["events"] or state["bag"] != after["bag"] or self.goal.done(after)
-            if self.goal.focus in {"heal", "train", "catch", "team"}:
-                useful |= state["party"] != after["party"]
-            self.no_progress = 0 if useful else self.no_progress + 1
+            useful |= closer
+        if self.goal and (useful or self.goal.done(after)):
+            self.no_progress = 0
+        elif self.goal and state["mode"] == "overworld":
+            self.no_progress += 1
 
     @staticmethod
     def change_key(state):
@@ -255,6 +362,7 @@ class Agent:
         memory = {"version": 1, "visited": sorted(self.game.visited), "interactions": sorted(self.game.interactions),
                   "outside_map": self.game.outside_map, "last_map": self.game.last_map, "frames": self.game.frames,
                   "history": self.history, "failures": self.failures,
+                  "losses": self.losses, "wiped_now": self.wiped_now, "pending_item": self.pending_item,
                   "previous": self.previous, "completed_goals": self.completed_goals,
                   "active_goal": self.goal.to_dict() if self.goal else None,
                   "route_memory": self.navigation.memory.to_dict() if hasattr(self.navigation, "memory") else None}
@@ -288,6 +396,11 @@ class Agent:
         self.game.outside_map, self.game.last_map = memory["outside_map"], memory["last_map"]
         self.game.frames = memory["frames"]
         self.history, self.failures = memory["history"], memory["failures"]
+        self.losses = memory.get("losses", {})
+        self.wiped_now = memory.get("wiped_now", False)
+        self.pending_item = memory.get("pending_item")
+        self.item_fresh = False
+        self.observed = None
         if hasattr(self.navigation, "memory"):
             self.navigation.memory.load(memory.get("route_memory"))
         self.completed_goals = memory["completed_goals"]

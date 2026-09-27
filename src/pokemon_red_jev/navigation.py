@@ -513,9 +513,57 @@ class Navigation:
         return self.regions.field_move_needed(state["map_id"], state["x"], state["y"], self.objective(target))
 
     def objective(self, target):
-        milestone = (self.state or {}).get("milestone") or {}
-        at = (milestone.get("missing_need") or milestone).get("at")
-        return (target, at["x"], at["y"]) if at and at["map"] == target else target
+        """Route to the story's room on this map, even when the active task only says to arrive."""
+        state = self.state or {}
+        milestone = state.get("milestone") or {}
+        need = milestone.get("missing_need")
+        active = state.get("active_goal") or {}
+        if active.get("target_map") != target:
+            active = {}
+        if need:
+            if target != need.get("map"):
+                return target
+            at = need.get("at")
+            if at and at.get("map") == target:
+                return target, at["x"], at["y"]
+            return self._item_spot(target, milestone, active) or target
+        if target not in (milestone.get("maps") or []):
+            return target
+        at = milestone.get("at")
+        if at and at.get("map") == target:
+            return target, at["x"], at["y"]
+        md = next((md for md in self.game.rom.maps.values() if md["name"] == target), None)
+        if md and target.endswith("_GYM"):
+            leader = next((obj for obj in md["objects"]
+                           if obj.get("trainer") and re.fullmatch(
+                               r"BROCK|MISTY|LT\.?SURGE|ERIKA|KOGA|SABRINA|BLAINE|GIOVANNI",
+                               obj.get("trainer_class") or "")), None)
+            if leader:
+                return target, leader["x"], leader["y"] + 1
+        return self._item_spot(target, milestone, active) or target
+
+    def _item_spot(self, target, milestone, active):
+        """The item ball named by the story or by the active task, on this map."""
+        md = next((md for md in self.game.rom.maps.values() if md["name"] == target), None)
+        if md is None:
+            return None
+
+        def leaves(check):
+            if not isinstance(check, dict):
+                return []
+            if check.get("kind") in {"all", "any"}:
+                return [leaf for child in check.get("value") or [] for leaf in leaves(child)]
+            return [check]
+
+        named = {check.get("value") for check in leaves((active or {}).get("success") or milestone.get("success") or {})
+                 if check.get("kind") == "item"}
+        letters = re.sub(r"[^A-Z]", "", f"{milestone.get('goal') or ''} {(active or {}).get('goal') or ''}".upper())
+        for obj in md["objects"]:
+            item = obj.get("item")
+            token = re.sub(r"[^A-Z]", "", str(item or "").upper())
+            if item and (item in named or len(token) >= 5 and token in letters):
+                return target, obj["x"], obj["y"]
+        return None
 
     def floor_hops(self, floor_id, elevator_id, target):
         """Areas from the floor's elevator landing to the goal. Whole-floor rooms if the landing is unknown."""
@@ -601,6 +649,7 @@ class Navigation:
         from .controls import pc_summary
         from .regions import switch_fact
         g = self.game
+        state["active_goal"] = goal.to_dict()
         self.update(state)
         self.memory.sync(state)
         grid, mid = Grid(g), state["map_id"]

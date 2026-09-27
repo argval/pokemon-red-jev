@@ -20,7 +20,7 @@ from pokemon_red_jev.demo import DemoGame, DemoJev, DemoNavigation, DemoPlanner,
 from pokemon_red_jev.goals import Goal, complete, current_milestone, story
 from pokemon_red_jev.game import Game
 from pokemon_red_jev.models import CodexPlanner, Jev, ModelError, Planner, codex_json, post_json
-from pokemon_red_jev.navigation import Action, RouteMemory, boulder_actions, find_path, floor_phrase, supply_actions
+from pokemon_red_jev.navigation import Action, Navigation, RouteMemory, boulder_actions, find_path, floor_phrase, supply_actions
 from pokemon_red_jev.regions import Regions, switch_distances, switch_fact, switch_reach
 from pokemon_red_jev.stage import LINE_H, PANEL_H, PanelRenderer, overlay_lines
 
@@ -635,6 +635,154 @@ class CoreChecks(unittest.TestCase):
         agent.step()
         self.assertEqual(agent.history[-1]["action"], "exit:down")
         self.assertTrue(any(r["kind"] == "retry" for r in records))
+
+    def test_options_screen_is_not_an_endless_wait(self):
+        rows = ["TEXT SPEED", " FAST", "BATTLE ANIMATION", " ON"]
+        screen = dict(rows=rows, cursor=(1, 1), waiting=False)
+        game = SimpleNamespace(settle_screen=lambda: None, screen=lambda: screen, menu_ready=lambda: (_ for _ in ()).throw(AssertionError("options")))
+        self.assertEqual(Controls(game).actions({"mode": "dialog"})[0].kind, "options")
+        blank = [" " * 20] * 18
+        waiting = dict(rows=blank, cursor=(2, 2), waiting=False)
+        loop = SimpleNamespace(settle_screen=lambda: None, screen=lambda: waiting, menu_ready=lambda: False,
+                               in_routine=lambda start, end: start == "DisplayOptionMenu")
+        self.assertEqual(Controls(loop).actions({"mode": "dialog"})[0].kind, "options")
+        frames = {"n": 0}
+
+        def blinking():
+            mark = "▶" if frames["n"] % 2 else "▷"
+            frames["n"] += 1
+            shown = [mark + "HELLO"] + [" " * 20] * 17
+            return dict(rows=shown, cursor=(0, 0), waiting=False)
+
+        controls = Controls(SimpleNamespace(settle_screen=lambda: None, screen=blinking, menu_ready=lambda: False))
+        kinds = [controls.actions({"mode": "dialog"})[0].key for _ in range(40)]
+        self.assertEqual(kinds[-1], "cancel")
+        self.assertTrue(all(key == "wait" for key in kinds[:-1]))
+
+    def test_story_room_survives_an_arrival_only_goal(self):
+        nav = Navigation.__new__(Navigation)
+        nav.game = SimpleNamespace(rom=SimpleNamespace(maps={
+            1: {"name": "SAFFRON_GYM", "objects": [
+                {"trainer": True, "trainer_class": "SABRINA", "x": 9, "y": 8, "item": None}]},
+            2: {"name": "POKEMON_MANSION_B1F", "objects": [
+                {"trainer": False, "item": "FULL RESTORE", "x": 1, "y": 22},
+                {"trainer": False, "item": "SECRET KEY", "x": 5, "y": 13}]},
+        }))
+        nav.state = {"milestone": {"goal": "Defeat Sabrina at the Saffron City Gym.", "maps": ["SAFFRON_GYM"],
+                                   "success": {"kind": "badge", "value": 6}, "missing_need": None},
+                     "active_goal": {"goal": "Go to the gym", "target_map": "SAFFRON_GYM",
+                                     "success": {"kind": "map", "value": "SAFFRON_GYM"}}}
+        self.assertEqual(nav.objective("SAFFRON_GYM"), ("SAFFRON_GYM", 9, 9))
+        self.assertEqual(nav.objective("VIRIDIAN_CITY"), "VIRIDIAN_CITY")
+        nav.state = {"milestone": {"goal": "Explore the Pokémon Mansion to find the Secret Key.",
+                                   "maps": ["POKEMON_MANSION_B1F"], "success": {"kind": "item", "value": "SECRET KEY"},
+                                   "missing_need": None},
+                     "active_goal": {"goal": "Enter the mansion", "target_map": "POKEMON_MANSION_B1F",
+                                     "success": {"kind": "map", "value": "POKEMON_MANSION_B1F"}}}
+        self.assertEqual(nav.objective("POKEMON_MANSION_B1F"), ("POKEMON_MANSION_B1F", 5, 13))
+
+    def test_same_map_teleport_is_not_a_blocked_exit(self):
+        class Regions:
+            def at(self, mid, x, y):
+                return (mid, 0) if (x, y) == (1, 1) else (mid, 4)
+
+            def landing(self, region):
+                return {region} if region else set()
+
+        agent, _ = new_agent()
+        agent.navigation.regions = Regions()
+        action = Action("door:3", "Teleport pad", "door", target={"map": 7, "x": 1, "y": 3, "edges": ["7:0>99:99"]})
+        state = {"map": "SAFFRON_GYM", "map_id": 7, "x": 1, "y": 1}
+        landed = {"map": "SAFFRON_GYM", "map_id": 7, "x": 8, "y": 4}
+        self.assertTrue(agent._exit_cleared(state, landed, action))
+        self.assertFalse(agent._exit_cleared(state, dict(state), action))
+        left = {"map": "SAFFRON_CITY", "map_id": 8, "x": 1, "y": 1}
+        self.assertTrue(agent._exit_cleared(state, left, action))
+
+    def test_exhausted_mon_can_struggle_beside_other_actions(self):
+        player = dict(level=20, attack=40, defense=20, special=20, types=["NORMAL"], hp=10, max_hp=30, status="OK", slot=0)
+        enemy = dict(level=5, attack=10, defense=10, special=10, types=["NORMAL"], hp=20, max_hp=20,
+                     status="OK", species="RATTATA", catch_rate=255, dex=19)
+        fainted = dict(nickname="SLEEPY", species="CATERPIE", level=4, hp=0, max_hp=20, types=["BUG"], slot=2, moves=[])
+        bench = dict(nickname="BLUE", species="PIDGEY", level=12, hp=20, max_hp=20, types=["NORMAL"], slot=1,
+                     moves=[dict(name="GUST", type="FLYING", power=40, pp=0, accuracy=100)])
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=lambda attack, defense: 1),
+                               u8=lambda name: 7, owned=lambda dex: False)
+        state = dict(map="ROUTE_1", mode="battle", party=[
+            dict(nickname="JEV", species="RATTATA", level=20, hp=10, max_hp=30, types=["NORMAL"], slot=0, moves=[]),
+            bench, fainted],
+            bag=[{"name": "POTION", "qty": 1}, {"name": "REVIVE", "qty": 1}, {"name": "MAX REVIVE", "qty": 1},
+                 {"name": "POKé BALL", "qty": 2}],
+            battle=dict(kind="wild", player=player, enemy=enemy, active_slot=0, safari=False,
+                        moves=[dict(name="TACKLE", type="NORMAL", power=35, pp=0, accuracy=95, slot=0)]))
+        actions = {a.key: a for a in Controls(game).battle_actions(state)}
+        self.assertIn("struggle", actions)
+        self.assertIn("switch:1", actions)
+        self.assertIn("item:POTION", actions)
+        self.assertIn("run", actions)
+        self.assertIn("revive:REVIVE:2", actions)
+        self.assertIn("revive:MAX REVIVE:2", actions)
+        self.assertEqual(actions["revive:MAX REVIVE:2"].target["name"], "MAX REVIVE")
+        self.assertNotEqual(actions["revive:REVIVE:2"].key, actions["revive:MAX REVIVE:2"].key)
+
+    def test_revive_search_does_not_land_on_max_revive(self):
+        cells = [[" "] * 20 for _ in range(18)]
+        for i, ch in enumerate("MAX REVIVE"):
+            cells[2][i] = ch
+        for i, ch in enumerate("REVIVE"):
+            cells[4][i] = ch
+        for i, ch in enumerate("YES NO"):
+            cells[6][i] = ch
+        controls = Controls(SimpleNamespace(screen=lambda: {"cells": cells, "cursor": (0, 0)}))
+        self.assertEqual(controls.find("MAX REVIVE"), (0, 2))
+        self.assertEqual(controls.find("REVIVE"), (0, 4))
+        self.assertEqual(controls.find("NO")[1], 6)
+
+    def test_canceled_item_does_not_count_as_used_when_the_menu_opens(self):
+        agent, _ = new_agent()
+        agent.navigation.memory = RouteMemory()
+        agent.game.state["bag"] = [{"name": "POTION", "qty": 1}]
+        before = agent.game.snapshot()
+        agent.pending_item = {"name": "POTION", "before": Agent.supply_key(before)}
+        agent.item_fresh = True
+        agent.game.state["x"] = 3
+        agent.game.state["mode"] = "dialog"
+        agent.game.state["screen"] = ["ITEM", "POTION"]
+        agent._observe(agent.game.snapshot())
+        self.assertEqual(agent.navigation.memory.item_unused, {})
+        self.assertIsNotNone(agent.pending_item)
+        agent.item_fresh = False
+        agent.game.state["mode"] = "overworld"
+        agent._observe(agent.game.snapshot())
+        self.assertEqual(agent.navigation.memory.item_unused.get("POTION"), 1)
+        agent.pending_item = {"name": "POTION", "before": Agent.supply_key(agent.game.snapshot())}
+        agent.game.state["bag"] = [{"name": "POTION", "qty": 0}]
+        agent._observe(agent.game.snapshot())
+        self.assertNotIn("POTION", agent.navigation.memory.item_unused)
+
+    def test_battle_level_gain_clears_a_pending_stall(self):
+        agent, records = new_agent()
+        agent.goal = Goal("Grow stronger", "progress", "ROUTE_1", {"kind": "level", "value": 50}, 20)
+        agent.milestone_id = "parcel"
+        agent.observed = agent.game.snapshot()
+        agent.no_progress = 8
+        agent.game.state["mode"] = "battle"
+        agent.game.state["party"][0]["level"] = 8
+        agent.game.state["party"][0]["experience"] = 400
+
+        class BattleControls:
+            def actions(self, state):
+                return [Action("wait", "Wait for the attack", "wait")]
+
+            def execute(self, action):
+                pass
+
+        agent.controls = BattleControls()
+        agent.jev.choose = lambda state, options: "wait"
+        agent.step()
+        self.assertEqual(agent.no_progress, 0)
+        self.assertTrue(agent.goal)
+        self.assertFalse(any(r["kind"] == "goal_end" and r.get("outcome") == "stalled" for r in records))
 
 
 if __name__ == "__main__":

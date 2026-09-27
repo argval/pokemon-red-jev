@@ -5,6 +5,10 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
 
 # Virtual environments
 .venv
@@ -21,3 +25,6 @@ logs/
 vendor/
 data/
 .DS_Store
+
+# Local knowledge-graph artifacts
+graphify-out/

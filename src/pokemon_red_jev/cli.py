@@ -48,6 +48,8 @@ class Log:
 class Manual:
     """Select the same candidates Jev sees, without an API client."""
 
+    manual = True
+
     def __init__(self):
         self.calls = 0
         self.input_tokens = 0
@@ -165,6 +167,9 @@ def main():
                 agent.load(args.resume)
                 game.tick()  # Present the restored frame in the native window.
             last_save = time.monotonic()
+            # The periodic save can land mid-loop. This one is only written right after a goal completes.
+            good = args.save.with_name(f"{args.save.stem}-good{args.save.suffix}")
+            completed = agent.completed_goals
             errors = 0
             remaining = None if args.steps == 0 else args.steps
             if remaining is None:
@@ -179,11 +184,22 @@ def main():
                         errors += 1
                         if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
                             raise ModelError(f"TypeSafe rejected the Jev API request ({exc})") from exc
-                        if errors >= 3:
+                        if exc.retryable:
+                            delay = min(60, 2 ** min(errors, 6))
+                            if errors == 1:
+                                agent.save(args.save)
+                                last_save = time.monotonic()
+                            log("service_wait", retry_seconds=delay, message="Model service unavailable; game paused, retrying automatically")
+                            game.pause(delay)
+                        elif errors >= 3:
                             raise ModelError("Three consecutive Jev failures; stopped and saved") from exc
-                        time.sleep(1)
+                        else:
+                            game.pause(1)
                     if remaining is not None:
                         remaining -= 1
+                    if agent.completed_goals != completed:
+                        completed = agent.completed_goals
+                        agent.save(good)
                     if time.monotonic() - last_save >= 60:
                         agent.save(args.save)
                         last_save = time.monotonic()

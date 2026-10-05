@@ -25,63 +25,9 @@ class RealOpening(unittest.TestCase):
         game = Game(Path(os.environ["ROM_PATH"]), Data(Path(os.getenv("GAME_DATA_PATH", "data/generated.json"))),
                     headless=True, speed=0)
         nav, controls = Navigation(game), Controls(game)
-        milestones = set()
         with patch("pokemon_red_jev.models.post_json", side_effect=AssertionError("ROM checks must not call models")):
             try:
-                for step in range(2400):
-                    state = game.snapshot()
-                    events = set(state["events"])
-                    for event in ["EVENT_FOLLOWED_OAK_INTO_LAB", "EVENT_GOT_STARTER", "EVENT_BATTLED_RIVAL_IN_OAKS_LAB",
-                                  "EVENT_GOT_OAKS_PARCEL", "EVENT_GOT_POKEDEX"]:
-                        if event in events and event not in milestones:
-                            milestones.add(event)
-                            print(f"ROM check [{step}]: {event}", flush=True)
-                    if "EVENT_GOT_POKEDEX" in events and state["mode"] == "overworld":
-                        break
-                    if state["mode"] == "busy":
-                        game.tick(12)
-                        continue
-                    if state["mode"] == "overworld":
-                        actions = nav.actions(state, fallback_goal(state))
-                        returning = "EVENT_GOT_OAKS_PARCEL" in events
-                        where = state["map"]
-                        if where in {"REDS_HOUSE_2F", "REDS_HOUSE_1F"}:
-                            key = "door:0"
-                        elif where == "PALLET_TOWN":
-                            key = "door:2" if returning else "exit:up"
-                        elif where == "OAKS_LAB":
-                            key = "npc:4" if not state["party"] else "npc:5" if returning else "door:0"
-                        elif where == "ROUTE_1":
-                            key = "exit:down" if returning else "exit:up"
-                        elif where == "VIRIDIAN_CITY":
-                            mart = next(i for i, w in enumerate(game.rom.maps[state["map_id"]]["warps"])
-                                        if game.rom.maps[w["map"]]["name"] == "VIRIDIAN_MART")
-                            key = "exit:down" if returning else f"door:{mart}"
-                        elif where == "VIRIDIAN_MART":
-                            key = "door:0" if returning else "npc:1"
-                        else:
-                            self.fail(f"Unexpected map {where}")
-                        action = next((a for a in actions if a.key == key), None)
-                        self.assertIsNotNone(action, f"Missing {key} at {where} {state['x']},{state['y']}")
-                        nav.execute(action)
-                        continue
-                    actions = controls.actions(state)
-                    self.assertTrue(actions, "No dialog/battle actions")
-                    choices = {a.key: a for a in actions}
-                    text = " ".join(game.screen()["rows"])
-                    labels = ["NEW GAME", "RED", "BLUE", "NO" if "nickname" in text.lower() else "YES"]
-                    action = next((a for label in labels for a in actions if a.target.get("label") == label), None)
-                    if "run" in choices:
-                        action = choices["run"]
-                    elif "move:0" in choices:
-                        action = choices["move:0"]
-                    elif "name:done" in choices:
-                        action = choices["name:done"]
-                    elif "letter:J" in choices:
-                        action = choices["letter:J"]
-                    controls.execute(action or actions[0])
-                else:
-                    self.fail(f"Opening timed out: {state['map']} {state['mode']}\n" + "\n".join(state["screen"]))
+                state, milestones = self.reach_pokedex(game)
                 self.assertEqual(len(milestones), 5)
                 self.assertTrue(state["party"])
                 self.assertNotIn("OAK'S PARCEL", [i["name"] for i in state["bag"]])
@@ -96,3 +42,62 @@ class RealOpening(unittest.TestCase):
                 print(f"ROM check passed; checkpoint: {path}", flush=True)
             finally:
                 game.close()
+
+    def reach_pokedex(self, game):
+        nav, controls = Navigation(game), Controls(game)
+        milestones = set()
+        for step in range(2400):
+            state = game.snapshot()
+            events = set(state["events"])
+            for event in ["EVENT_FOLLOWED_OAK_INTO_LAB", "EVENT_GOT_STARTER", "EVENT_BATTLED_RIVAL_IN_OAKS_LAB",
+                          "EVENT_GOT_OAKS_PARCEL", "EVENT_GOT_POKEDEX"]:
+                if event in events and event not in milestones:
+                    milestones.add(event)
+                    print(f"ROM check [{step}]: {event}", flush=True)
+            if "EVENT_GOT_POKEDEX" in events and state["mode"] == "overworld":
+                break
+            if state["mode"] == "busy":
+                game.tick(12)
+                continue
+            if state["mode"] == "overworld":
+                actions = nav.actions(state, fallback_goal(state))
+                returning = "EVENT_GOT_OAKS_PARCEL" in events
+                where = state["map"]
+                if where in {"REDS_HOUSE_2F", "REDS_HOUSE_1F"}:
+                    key = "door:0"
+                elif where == "PALLET_TOWN":
+                    key = "door:2" if returning else "exit:up"
+                elif where == "OAKS_LAB":
+                    key = "npc:4" if not state["party"] else "npc:5" if returning else "door:0"
+                elif where == "ROUTE_1":
+                    key = "exit:down" if returning else "exit:up"
+                elif where == "VIRIDIAN_CITY":
+                    mart = next(i for i, w in enumerate(game.rom.maps[state["map_id"]]["warps"])
+                                if game.rom.maps[w["map"]]["name"] == "VIRIDIAN_MART")
+                    key = "exit:down" if returning else f"door:{mart}"
+                elif where == "VIRIDIAN_MART":
+                    key = "door:0" if returning else "npc:1"
+                else:
+                    self.fail(f"Unexpected map {where}")
+                action = next((a for a in actions if a.key == key), None)
+                self.assertIsNotNone(action, f"Missing {key} at {where} {state['x']},{state['y']}")
+                nav.execute(action)
+                continue
+            actions = controls.actions(state)
+            self.assertTrue(actions, "No dialog/battle actions")
+            choices = {a.key: a for a in actions}
+            text = " ".join(game.screen()["rows"])
+            labels = ["NEW GAME", "RED", "BLUE", "NO" if "nickname" in text.lower() else "YES"]
+            action = next((a for label in labels for a in actions if a.target.get("label") == label), None)
+            if "run" in choices:
+                action = choices["run"]
+            elif "move:0" in choices:
+                action = choices["move:0"]
+            elif "name:done" in choices:
+                action = choices["name:done"]
+            elif "letter:J" in choices:
+                action = choices["letter:J"]
+            controls.execute(action or actions[0])
+        else:
+            self.fail(f"Opening timed out: {state['map']} {state['mode']}\n" + "\n".join(state["screen"]))
+        return state, milestones

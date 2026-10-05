@@ -101,6 +101,8 @@ def overlay_lines(state, controller, width):
         built = [*header]
         built += [*gap, "# MILESTONE", *wrap(goal, width)[:story_lines]]
         built += [*gap, "# GOAL", *(wrap(active_text, width)[:goal_lines] if active_text else ["~ none yet"])]
+        if state.get("agent_status"):
+            built += ["~ " + line for line in wrap(state["agent_status"], width - 2)[:2]]
         built += [*gap, "# WHERE", where]
         built += [*gap, "# TEAM", *party_lines]
         if decision:

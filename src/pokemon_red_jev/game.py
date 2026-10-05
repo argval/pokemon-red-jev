@@ -2,6 +2,7 @@
 
 import hashlib
 from pathlib import Path
+import time
 
 from .controls import describe_effect
 from .data import Data, RED_SHA1
@@ -90,6 +91,11 @@ class Rom:
             self.maps[mid] = dict(id=mid, name=meta["name"], bank=bank, width=width, height=height,
                                   tileset=tileset, blocks=blocks, connections=connections, warps=warps,
                                   signs=signs, objects=objects)
+            wild = sym("WildDataPointers")
+            encounters = self.flat(wild // 0x4000, self.u16(wild + mid * 2))
+            self.maps[mid]["grass_rate"] = self.b[encounters]
+            self.maps[mid]["wild"] = [{"level": self.b[a], "species_id": self.b[a + 1]}
+                                      for a in range(encounters + 1, encounters + 21, 2)] if self.b[encounters] else []
         self.machines = list(self.b[sym("TechnicalMachines"):sym("TechnicalMachines") + 55])
         self.hidden, self.spinners = {}, {}
         names = {a: n for n, a in data.symbols.items() if a >= 0x4000 and "." not in n}
@@ -215,6 +221,17 @@ def quiet_rows(rows):
     return tuple(row.replace("▶", " ").replace("▷", " ") for row in rows)
 
 
+def hm_names(record):
+    """HMs this species can be taught, from the ROM compatibility bytes."""
+    machines = (record or {}).get("machines") or []
+    names = []
+    for index in range(5):
+        bit = 50 + index
+        if bit // 8 < len(machines) and machines[bit // 8] & (1 << (bit % 8)):
+            names.append(f"HM{index + 1:02}")
+    return names
+
+
 def status(value):
     if value & 7:
         return "SLEEP"
@@ -258,6 +275,14 @@ class Game:
         if self.stage:
             self.stage.show(state, controller, self.pyboy.screen)
 
+    def pause(self, seconds):
+        """Keep Escape/window close responsive without advancing the emulator during a retry."""
+        until = time.monotonic() + seconds
+        while (left := until - time.monotonic()) > 0:
+            if self.stage:
+                self.stage.present(self.pyboy.screen)
+            time.sleep(min(.1, left))
+
     def press(self, button, hold=6, settle=12):
         self.pyboy.button_press(button)
         try:
@@ -294,7 +319,13 @@ class Game:
 
     def in_routine(self, start, end):
         """True when a return address on the stack is inside this routine. Does not advance frames."""
-        return self._return_in(self.data.sym(start), self.data.sym(end))
+        lo, hi = self.data.sym(start), self.data.sym(end)
+        if lo >= 0x4000:
+            bank = lo // 0x4000
+            if self.u8("hLoadedROMBank") != bank:
+                return False
+            lo, hi = lo - (bank - 1) * 0x4000, hi - (bank - 1) * 0x4000
+        return self._return_in(lo, hi)
 
     def _return_in(self, lo, hi):
         sp = self.pyboy.register_file.SP
@@ -354,8 +385,7 @@ class Game:
                                status=status(self.memory[a + 4]), types=sp.get("types", []), moves=self.moves_at(a + 8, a + 29),
                                attack=self.be16(a + 36), defense=self.be16(a + 38), speed=self.be16(a + 40), special=self.be16(a + 42),
                                experience=(self.memory[a + 14] << 16) | (self.memory[a + 15] << 8) | self.memory[a + 16],
-                               learnable_hms=[f"HM{j + 1:02}" for j in range(5)
-                                              if sp.get("machines", [0] * 7)[(50 + j) // 8] & (1 << ((50 + j) % 8))]))
+                               learnable_hms=hm_names(sp)))
         return result
 
     def bag(self):
@@ -368,8 +398,11 @@ class Game:
         for i in range(min(20, self.u8("wBoxCount"))):
             a = self.data.sym("wBoxMons") + i * 33
             n = self.data.sym("wBoxMonNicks") + i * 11
-            result.append(dict(species=self.rom.species.get(self.memory[a], {}).get("name", "?"),
-                               nickname=self.data.decode(self.memory[n:n + 11]), level=self.memory[a + 3]))
+            sp = self.rom.species.get(self.memory[a], {})
+            result.append(dict(slot=i, species=sp.get("name", "?"), species_id=self.memory[a],
+                               nickname=self.data.decode(self.memory[n:n + 11]), level=self.memory[a + 3],
+                               types=list(sp.get("types") or []), learnable_hms=hm_names(sp),
+                               moves=self.moves_at(a + 8, a + 29)))
         return result
 
     def screen(self):
@@ -443,9 +476,14 @@ class Game:
         for i in range(3):
             b = self.u8("wPlayerMoney", i)
             money = money * 100 + (b >> 4) * 10 + (b & 15)
+        blackout = None
+        try:
+            blackout = self.data.maps.get(self.u8("wLastBlackoutMap"), {}).get("name")
+        except (KeyError, AttributeError):
+            blackout = None
         state = dict(map=name, map_id=mid, x=self.u8("wXCoord"), y=self.u8("wYCoord"), mode=mode,
                      badges=self.u8("wObtainedBadges"), money=money, party=self.party(), bag=self.bag(), box=self.box(),
-                     saffron_open=bool(self.u8("wStatusFlags1") & 0x40),
+                     blackout=blackout, saffron_open=bool(self.u8("wStatusFlags1") & 0x40),
                      events=events, visited=sorted(self.visited), interactions=sorted(self.interactions),
                      screen=self.screen()["rows"], battle=self.battle() if mode == "battle" else None)
         state["milestone"] = current_milestone(state)

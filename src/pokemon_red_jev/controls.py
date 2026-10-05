@@ -3,7 +3,7 @@
 import re
 
 from .goals import next_gym
-from .navigation import Action
+from .navigation import FLY_TOWNS, Action
 
 PHYSICAL = {"NORMAL", "FIGHTING", "FLYING", "POISON", "GROUND", "ROCK", "BUG", "GHOST"}
 HEAL = {"POTION": 20, "SUPER POTION": 50, "HYPER POTION": 200, "MAX POTION": 999, "FULL RESTORE": 999,
@@ -178,6 +178,32 @@ def gym_sentence(state, attack_types, effectiveness, subject):
     return f"{subject} is neutral into the next gym, {leader} ({shown})."
 
 
+def leave_shop_fact(money):
+    """QUIT on a mart counter. Say so when another Poké Ball is unaffordable."""
+    text = "Leave the shop and return to the map."
+    if isinstance(money, int) and money < 200:
+        text += f" You have ¥{money}. A Poké Ball costs ¥200, so another ball is unaffordable."
+    return text
+
+
+def quantity_actions(state, text):
+    """The mart's how-many box. Up and down change the count; A buys; B returns to the list."""
+    count = re.search(r"(?:x|×)\s*(\d+)", text, re.I)
+    price = re.search(r"(?:¥|<ED>)\s*(\d+)", text[count.end():]) if count else None
+    qty = count.group(1) if count else "1"
+    cost = price.group(1) if price else "?"
+    money = state.get("money")
+    afford = ""
+    if isinstance(money, int) and cost.isdigit():
+        afford = f" You have ¥{money}, which is not enough." if money < int(cost) else f" You have ¥{money}."
+    return [
+        Action("buy:yes", f"Buy {qty} of the selected item for ¥{cost}.{afford}", "button", target={"button": "a"}),
+        Action("buy:more", "Increase how many you buy.", "button", target={"button": "up"}),
+        Action("buy:less", "Decrease how many you buy.", "button", target={"button": "down"}),
+        Action("buy:no", "Do not buy it. Returns to the item list.", "button", target={"button": "b"}),
+    ]
+
+
 def shop_note(rows, label, bag):
     """Price printed on a shop screen, plus what the item is for."""
     screen = " / ".join(re.sub(r"[┌─┐│└┘]", " ", row).strip() for row in rows if str(row).strip())
@@ -251,6 +277,18 @@ def menu_note(rows, label, state, pc_mode=None):
                 details.append(f"{move} ({', '.join(others)} also knows it)" if others else f"{move} (no other team member knows it)")
             sentence = "Picking it DEPOSITS it: it leaves the team and goes into the PC box."
             notes.append(sentence if not details else sentence + " Knows field moves: " + "; ".join(details) + ".")
+    if label == "RELEASE":
+        notes.append("Permanently lets this Pokémon go. It is gone for good.")
+    elif label == "CHANGE BOX":
+        notes.append("Switch to another PC box.")
+    elif label in {"WITHDRAW ITEM", "DEPOSIT ITEM"}:
+        notes.append("Item storage, not Pokémon.")
+    elif label == "TOSS ITEM":
+        notes.append("Throw away a stored item. It is gone for good.")
+    elif "OAK" in label and label.endswith("PC"):
+        notes.append("Rates your Pokédex progress.")
+    elif label.endswith("PC") and "BILL" not in label and "SOMEONE" not in label:
+        notes.append("Item storage: store and take out items. No Pokémon here.")
     return " ".join(notes)
 
 
@@ -268,18 +306,34 @@ def party_unusable(rows, party_size):
 
 
 def note_menu(seen, screen, progress, limit=5):
-    """Count identical menus that change nothing. The fifth one should be closed."""
-    if seen and seen[0] == progress and seen[1] == screen:
-        count = seen[2] + 1
-    else:
-        count = 1
-    return (progress, screen, 0 if count >= limit else count), count >= limit
+    """Count returning menus, including cycles through submenus and cursor movement."""
+    counts = seen[1] if seen and seen[0] == progress else {}
+    screen = tuple(" ".join(row.replace("▶", " ").replace("▷", " ").split()) for row in screen)
+    count = counts.get(screen, 0) + 1
+    counts[screen] = 0 if count >= limit else count
+    if len(counts) > 200:
+        del counts[next(iter(counts))]
+    return (progress, counts), count >= limit
+
+
+def party_item_note(mon, item, move_name, unable):
+    """What using the open bag item would do to this party Pokémon."""
+    notes = []
+    if unable:
+        notes.append("NOT ABLE to use this item (choosing it does nothing).")
+    level = mon.get("level")
+    if item == "RARE CANDY" and isinstance(level, int):
+        notes.append(f"Rare Candy would raise it from Lv{level} to Lv{level + 1}.")
+    if move_name and any(move.get("name") == move_name for move in mon.get("moves") or []):
+        notes.append(f"Already knows {move_name}: choosing it does nothing.")
+    return " ".join(notes)
 
 
 def pc_summary(state):
     """Who is on the team and in the current box. Does not choose either."""
     party, box = state.get("party") or [], state.get("box") or []
-    shown = [f"{mon.get('species', '?')} Lv{mon.get('level', '?')}" for mon in box[:6]]
+    shown = [f"{mon.get('species', '?')} Lv{mon.get('level', '?')}"
+             + (f" ({'/'.join(mon['types'])})" if mon.get("types") else "") for mon in box[:6]]
     if len(box) > 6:
         shown.append(f"+{len(box) - 6} more")
     text = f"Party {len(party)}/6. Box: {', '.join(shown) if shown else 'empty'}."
@@ -410,7 +464,8 @@ class Controls:
             return [(p["nickname"], i) for i, p in enumerate(party)]
         y, x, last = g.u8("wTopMenuItemY"), g.u8("wTopMenuItemX"), g.u8("wMaxMenuItem")
         def clean(text):
-            return re.split(r"\s{2,}", re.sub(r"[┌─┐│└┘▶▷▼]", " ", text).strip())[0]
+            label = re.split(r"\s{2,}", re.sub(r"[┌─┐│└┘▶▷▼]", " ", text).strip())[0]
+            return re.sub(r"^(WITHDRAW|DEPOSIT|RELEASE) PKMN$", r"\1", label)
         if s["cursor"][0] == x and last < 12:
             for step in [2, 1]:
                 options = [(clean("".join(s["cells"][y + i * step][x + 1:])), i)
@@ -446,9 +501,11 @@ class Controls:
                 choices.append(Action("name:done", f"Finish the name {typed!r}.", "button", target={"button": "start"}))
             return choices
         # Options has its own joypad loop, outside HandleMenuInput, so menu_ready never becomes true there.
-        if self._options_open(rows):
+        if state["mode"] != "battle" and self._options_open(rows):
             self._menu_wait = None
             return [Action("options", "Set text speed to FAST, battle animations OFF, then close Options.", "options")]
+        if "TAKE YOUR TIME" in rows.upper() and re.search(r"(?:x|×)\s*\d+", rows, re.I) and not screen["waiting"]:
+            return quantity_actions(state, rows)
         if screen["cursor"] and not screen["waiting"] and not g.menu_ready():
             plain = tuple(row.replace("▶", " ").replace("▷", " ") for row in screen["rows"])
             self._menu_wait, stuck = note_menu(self._menu_wait, plain, None, limit=40)
@@ -463,7 +520,9 @@ class Controls:
         if screen["waiting"] or not screen["cursor"]:
             return [Action("advance", "Advance dialogue or wait for the animation.", "button", target={"button": "a"})]
         actions = []
-        for i, (label, index) in enumerate(self.options()):
+        labels = self.options()
+        fly_open = sum(label in FLY_TOWNS for label, _ in labels) >= 2
+        for i, (label, index) in enumerate(labels):
             if label == "OPTION" and "NEW GAME" in rows:
                 continue
             facts = label
@@ -475,21 +534,29 @@ class Controls:
             if pokemon:
                 if state["mode"] == "battle" and pokemon["hp"] == 0:
                     continue
-                if screen["cursor"][0] == 0 and "NOT ABLE" in screen["rows"][pokemon["slot"] * 2 + 1]:
-                    continue
+                unable = screen["cursor"][0] == 0 and pokemon["slot"] * 2 + 1 < len(screen["rows"]) and "NOT ABLE" in screen["rows"][pokemon["slot"] * 2 + 1]
                 facts += f". {pokemon['species']} Lv{pokemon['level']} HP {pokemon['hp']}/{pokemon['max_hp']}; moves {[m['name'] for m in pokemon['moves']]}"
+                move_name = None
+                using = state.get("using_item")
+                if using and hasattr(g, "rom"):
+                    machine = next((item for item, name in g.rom.items.items() if name == using and item >= 0xc4), None)
+                    taught = g.rom.machine(machine)[1] if machine is not None else None
+                    move_name = taught["name"] if taught else None
+                item_note = party_item_note(pokemon, using, move_name, unable)
+                if item_note:
+                    facts += ". " + item_note
             if "nickname" in rows.lower() and label == "YES":
                 facts += ". Gives this Pokémon a nickname."
-            if label == "RELEASE":
-                facts += ". Permanently gives away this Pokémon."
             if label == "DEPOSIT":
                 facts += ". Moves a team member into the box. " + pc_summary(state)
             if label == "WITHDRAW":
                 facts += ". Moves a boxed Pokémon onto the team. " + pc_summary(state)
-            if "BILL" in label and "PC" in label:
+            if ("BILL" in label or "SOMEONE" in label) and "PC" in label:
                 facts += ". Pokémon storage. " + pc_summary(state)
             if label == "BUY":
                 facts += f". Money {state['money']}; bag slots {len(state['bag'])}/20. Buy only needed supplies."
+            if label == "QUIT" and "BUY" in rows and "SELL" in rows:
+                facts = leave_shop_fact(state.get("money"))
             machine = next((item for item, name in g.rom.items.items() if name == label and item >= 0xc4), None)
             if machine is not None:
                 machine_index, move = g.rom.machine(machine)
@@ -510,14 +577,29 @@ class Controls:
                 extra = f"{extra} {context}".strip()
             if nav and re.fullmatch(r"B?\d{1,2}F", label):
                 extra = f"{extra} {nav.floor_choice(state, label)}".strip()
+            if nav and fly_open:
+                extra = f"{extra} {nav.fly_choice(state, label)}".strip()
             if extra:
                 facts += ". " + extra
-            actions.append(Action(f"menu:{i}", facts, "menu", target={"label": label, "index": index}))
+            target = {"label": label, "index": index}
+            roster = state.get("party") if pc_mode == "DEPOSIT" else state.get("box") if pc_mode == "WITHDRAW" else []
+            if roster and index is not None:
+                # Both PC lists scroll: the cursor reaches only the top three entries.
+                slot = index + g.u8("wListScrollOffset")
+                if slot < len(roster) and roster[slot].get("nickname") == label:
+                    target.update(pc_mode=pc_mode, pc_slot=slot, pc_count=len(roster))
+            actions.append(Action(f"menu:{i}", facts, "menu", target=target))
         forced_party = state["mode"] == "battle" and state["battle"]["player"]["hp"] == 0
         # B on the title menu returns to the intro and resets text speed and battle animations.
-        if not forced_party and "NEW GAME" not in rows:
+        # A mart counter already has QUIT. B there only redraws the same menu.
+        shop = "BUY" in rows and "SELL" in rows and "QUIT" in rows
+        if not forced_party and "NEW GAME" not in rows and "NEW NAME" not in rows and not shop:
             actions.append(Action("cancel", "Press B to close or back out of this menu.", "button", target={"button": "b"}))
-        if any("▼" in row or "<CONT>" in row for row in screen["rows"][:12]):
+        if shop and not any((a.target or {}).get("label") == "QUIT" for a in actions):
+            actions.append(Action("shop:quit", leave_shop_fact(state.get("money")), "menu", target={"label": "QUIT"}))
+        slots = [(a.target["pc_slot"], a.target["pc_count"]) for a in actions if "pc_slot" in a.target]
+        # The ▼ blinks. A PC list with entries past the last labeled slot can always scroll.
+        if any("▼" in row or "<CONT>" in row for row in screen["rows"][:12]) or slots and max(slots)[0] + 1 < slots[0][1]:
             actions.append(Action("scroll", "Scroll down to more list entries.", "button", target={"button": "down"}))
         return actions
 
@@ -544,6 +626,8 @@ class Controls:
             accuracy_stage = self.game.u8("wPlayerMonAccuracyMod")
             evasion_stage = self.game.u8("wEnemyMonEvasionMod")
             screens = self.game.u8("wPlayerBattleStatus3")
+        catching = (state.get("current_focus") == "catch" or (state.get("active_goal") or {}).get("focus") == "catch")
+        balls_left = sum(item.get("qty", 0) for item in state.get("bag") or [] if str(item.get("name", "")).endswith("BALL"))
         for move in b["moves"]:
             if not move["pp"]:
                 continue
@@ -566,8 +650,9 @@ class Controls:
             elif move["power"]:
                 low = high * 217 // 255
                 hp = b["enemy"]["hp"]
+                spoiled = " Knocks it out, so it can no longer be caught." if low >= hp and b["kind"] == "wild" and catching and balls_left else ""
                 effect = " Likely KO." if low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
-                desc += f" Rough damage {low}-{high}.{effect} Ignores critical hits and special effects. Enemy HP {hp}."
+                desc += f" Rough damage {low}-{high}.{effect}{spoiled} Ignores critical hits and special effects. Enemy HP {hp}."
             else:
                 desc += " Status move (no direct damage)."
                 if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
@@ -839,6 +924,8 @@ class Controls:
                 return "slot" not in t or self.select(g.party()[t["slot"]]["nickname"], t["slot"])
             return False
         elif action.kind == "item":
+            if t.get("direction"):
+                g.face(t["direction"])
             g.press("start", settle=20)
             if not (self.select("ITEM") and self.select(t["name"])):
                 return False

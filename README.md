@@ -19,7 +19,7 @@ The regression test follows a fixed route. Codex goal planning and Jev action se
 | Field actions | Cut/Surf/Strength approaches check the move and the required badge; Victory Road pushes aim at open switches and holes |
 | Hidden interactions / puzzles | PCs, switches, trash cans, quizzes, Card Key doors, Mansion gates across both switch positions, arrow landings, live elevator destinations |
 | Menus / team / battle | Input readiness, scrolling, HM/TM compatibility, PC/shop facts, healing, cures, revival, Safari choices, special damage facts |
-| Later-game behavior | Blocked exits, HM/Flute/full-bag choices, Mansion switch routing, and Victory Road boulder search are implemented. The PC lists the box and the six-Pokémon limit without choosing the team. Shop heuristics remain. None of this is played through on the real ROM past the opening |
+| Later-game behavior | Blocked exits, HM/Flute/full-bag choices, Mansion switch routing, and Victory Road boulder search are implemented. The PC lists the box and the six-Pokémon limit without choosing the team. Shop heuristics remain. Seeded ROM scenarios cover a Mansion continuation to B1F, Seafoam boulder drops on 1F/B1F, an 18-push Victory Road 1F sequence, and PC/shop loop recovery |
 
 ## Try it now
 
@@ -56,7 +56,7 @@ For `--planner cursor`, install the Cursor Agent CLI (`agent` or `cursor-agent`)
 
 The previous OpenRouter-compatible planner remains available with `--planner llm`. It requires `LLM_API_KEY` and `LLM_MODEL`; Codex and Cursor modes do not use them.
 
-Codex, Cursor, and HTTP request timeouts, plus Jev's rate limits, are configurable in `.env.example`. HTTP requests have one bounded retry. Jev and the HTTP planner require their respective credentials; manual control with Codex or Cursor planning needs only the matching CLI sign-in. An invalid or failed planner response installs a temporary story goal and retries planning after its budget expires. Repeated Jev failures stop the run and save progress.
+Codex, Cursor, and HTTP request timeouts, plus Jev's rate limits, are configurable in `.env.example`. HTTP requests have one bounded retry. Jev and the HTTP planner require their respective credentials; manual control with Codex or Cursor planning needs only the matching CLI sign-in. An invalid or failed planner response installs a temporary story goal and retries planning after its budget expires. Jev timeouts, network failures, HTTP 429, and HTTP 5xx responses save progress and pause emulation while retrying, with delays increasing from 2 to 60 seconds. Escape/window close remains responsive during the pause. Authentication errors stop immediately; three consecutive invalid responses also stop and save.
 
 ### Generate game symbols
 
@@ -100,33 +100,37 @@ agent status
 uv run pokemon-red-jev run --planner cursor --resume saves/rom-check.zip
 ```
 
-This uses your ChatGPT or Cursor sign-in for goal planning and the separate TypeSafe key for Jev's action choices. A planner process starts only when the active short-term goal finishes, stalls, or expires; Jev handles the intervening actions. CLI startup and model inference pause game emulation, so goal changes can take several seconds. Check your plan's usage limits for sustained runs.
+This uses your ChatGPT or Cursor sign-in for goal planning and the separate TypeSafe key for Jev's action choices. Before getting a starter, the runner follows the opening story directly. Naming, dialogue, and clear routes run without model requests; duplicate door tiles leading to the same room use the shorter walk. Ambiguous or repeatedly failed routes go to Jev. After obtaining a starter, the planner runs at startup/resume and when the active task needs recovery or expires; completed tasks normally advance to the next story goal. CLI startup and model inference pause game emulation, so model decisions can take several seconds. Check your plan's usage limits for sustained runs.
 
 To check planning before adding a TypeSafe key, run `uv run pokemon-red-jev run --controller manual --planner cursor --resume saves/rom-check.zip` (or `--planner codex`). You choose actions in the terminal while the planner proposes goals.
 
 The existing baselines remain available: `--planner off` needs only Jev's TypeSafe key, while `--planner llm` uses the OpenRouter-compatible fields in `.env`. The default controller is Jev and its default planner is `llm`; pass `--planner codex` or `--planner cursor` explicitly. `--speed 1` runs emulator frames at real-time speed; `0` removes that limit.
 
-`--steps` counts control-loop iterations, including animation waits and menus. The default is `0`, which runs indefinitely until the story is complete, Escape, or Ctrl-C. Pass a positive value for a bounded session (for example `--steps 1000`). Each task has a separate budget counting overworld decisions. Saves occur every 60 seconds between actions and at shutdown. A checkpoint stores emulator state and agent memory in one atomic archive. On resume, the planner receives fresh state and replaces the old active task. Use distinct `--save` and `--log` paths for separate experiments.
+`--steps` counts control-loop iterations, including animation waits and menus. The default is `0`, which runs indefinitely until the story is complete, Escape, or Ctrl-C. Pass a positive value for a bounded session (for example `--steps 1000`). Each task has a separate budget counting overworld decisions. Saves occur every 60 seconds between actions and at shutdown. A checkpoint stores emulator state and agent memory in one atomic archive. Pass `--resume saves/latest.zip` to continue; without `--resume`, the runner starts a new game. On resume, it replaces the old active task using fresh state. Use distinct `--save` and `--log` paths for separate experiments.
 
 ### Repeat the ROM check
 
 ```sh
 # Offline logic tests; the ROM test is skipped:
 uv run python -m unittest discover -s tests -v
-# All 20 checks, including the real opening:
+# All checks, including the real opening and isolated ROM scenarios:
 RUN_ROM_TESTS=1 uv run python -m unittest discover -s tests -v
 ```
 
-The ROM check starts a new game, selects a starter, handles the rival battle and wild encounters, collects the parcel, returns to Oak, and verifies the Pokédex event. It writes `saves/rom-check.zip`; it does not overwrite `saves/latest.zip`. It never edits RAM or calls either model. Run it again after changing movement, map loading, or menu timing.
+The opening ROM check starts a new game, selects a starter, handles the rival battle and wild encounters, collects the parcel, returns to Oak, and verifies the Pokédex event. It writes `saves/rom-check.zip`; it does not overwrite `saves/latest.zip`. It never edits RAM or calls either model. Run it again after changing movement, map loading, or menu timing.
+
+`tests/test_rom_scenarios.py` adds six isolated ROM checks. These seed capabilities and a doorway destination, then use production button drivers without model calls. They verify Mansion checkpoint continuation to B1F, two Seafoam boulder drops across floors, Victory Road progress without stall replanning, PC/shop loop exits, and travel from Pewter to a Route 2 wild encounter. A separate live Cursor + Jev replay from the player's checkpoint defeated Brock. See [PORT_AUDIT.md](PORT_AUDIT.md) for exact coverage and limits.
+
+`tests/test_autonomy.py` runs the real Agent from a fresh ROM boot through both house floors, Pallet Town, and Oak's introduction, asserting zero planner or model requests. It also checks service recovery after four consecutive failures, permanent authentication errors, manual choice preservation, failed/ambiguous route handling, and closing the window while paused.
 
 ## How the models cooperate
 
 1. The runner observes RAM, dialogue, recent failures, and the current story milestone.
 2. At an overworld decision boundary, the planner proposes one task with a map, a completion condition, and a decision limit.
 3. The app validates the task against known map/event/item/interaction identifiers. Already completed goals are rejected.
-4. Jev receives that goal, current state, and the available actions. Navigation facts refer to the task's destination.
+4. Jev receives that goal, current state, and the available actions. With a planner, its goal sets the focus before routes are built; without one, Jev selects a bounded focus. Training routes lead to reachable encounter grass, and the grass action paces for up to 40 steps or until interrupted. Every XP gain counts as training progress.
 5. The runner executes the selected action, records the outcome, and checks completion.
-6. Completion, a changed story milestone, a drop below 25% party HP, expiry, or stalled progress triggers another plan. Ordinary battle/menu interruptions retain the active task.
+6. Completion or a changed story milestone selects the next story task. Low HP, expiry, stalled progress, or an unavailable focus asks the planner for a new task. Ordinary battle/menu interruptions retain the active task.
 
 Example planner response:
 
@@ -147,7 +151,7 @@ No agent framework or additional service is needed. PyBoy is the only direct run
 ## Next steps
 
 1. **Validate sustained autonomous play.** Run `--planner codex` from a fresh game and inspect reached milestones and failed actions. The one-step live smoke test proves the models and runner connect; it does not measure longer-term decisions. The scripted regression proves the controls work.
-2. **Validate later gameplay.** Start with Brock, then test HM use, PC moves, the Pokémon Mansion switches, and Victory Road boulders from nearby checkpoints. Those choices are in the action list now; they have not been played through on the real ROM. The PC reports who is in the box and that the team holds six. It does not pick the team. Shop heuristics remain. Unseen scripted gates can still block a route until an exit fails often enough to be remembered.
+2. **Extend later-game coverage.** Continue from naturally played checkpoints through Seafoam B2F–B4F and Victory Road 2F/3F. The seeded ROM checks cover the Mansion route to B1F, early Seafoam drops, the first Victory Road switch, and menu recovery; they do not establish full autonomous completion.
 3. **Measure the planner.** Compare `--planner codex` and `--planner off` from copies of the same checkpoint, using separate saves/logs, equal throttles and a fixed wall-clock budget. Repeat runs and compare reached milestones, failures, model latency and token usage. The disabled-planner baseline uses milestone goals; it does not reproduce the original Jev intent-selection layer.
 
 Smaller goals are a hypothesis to measure, not a speed guarantee.

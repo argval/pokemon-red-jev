@@ -307,16 +307,16 @@ class Regions:
         d = self.distances(target, skip)
         return min((d[r] for r in regions if r in d), default=None)
 
-    def static(self, cut, surf, switch):
+    def static(self, cut, surf, switch, *, layout=False):
         """ROM layout for one HM/switch combination, without live sprites."""
-        key = (cut, surf, switch)
+        key = (cut, surf, switch, layout)
         if key not in self._static_cache:
             other = Regions(self.game)
             other.grids = {mid: Grid(self.game, mid, cut=cut, surf=surf,
                                     overrides={y * md["width"] + x: on if switch else off
                                                for y, x, off, on in MANSION.get(md["name"], [])})
                            for mid, md in self.maps.items()}
-            other.blocked = {mid: {(o["x"], o["y"]) for o in md["objects"] if o["picture"] == 63}
+            other.blocked = {mid: {(o["x"], o["y"]) for o in md["objects"] if o["picture"] == 63 and not layout}
                              for mid, md in self.maps.items()}
             for mid in other.maps:
                 other.label(mid)
@@ -369,6 +369,11 @@ class Regions:
             if via is not None and origin in via[0]:
                 return None
         cut, surf, switch = self.signature
+        baseline = self.static(cut, surf, switch)
+        start = baseline.at(map_id, x, y)
+        # Compare like-for-like layouts: removing an NPC is not evidence that CUT is needed.
+        if start is not None and baseline.distance({start}, target) is not None:
+            return None
         for move, caps in (("CUT", (True, surf, switch)), ("SURF", (cut, True, switch))):
             if caps[:2] == (cut, surf):
                 continue

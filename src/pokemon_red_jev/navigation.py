@@ -3,6 +3,7 @@
 from collections import deque
 from dataclasses import dataclass, field
 import heapq
+import random
 import re
 
 DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
@@ -38,6 +39,7 @@ class Grid:
         if overrides:
             self.layout = bytes(overrides.get(i, b) for i, b in enumerate(self.layout))
         self.cut, self.surf = cut, surf
+        self.map_id = game.u8("wCurMap") if map_id is None else map_id
         header = sym("Tilesets") + self.tileset * 12
         bank = r.b[header]
         self.blocks = r.flat(bank, r.u16(header + 1))
@@ -48,6 +50,7 @@ class Grid:
                 break
             self.passable.add(r.b[a])
         self.counters = set(r.b[header + 7:header + 10]) - {0xff}
+        self.grass_tile = r.b[header + 10]
         self.ledges, self.pairs = [], set()
         if self.tileset == 0:
             for a in range(sym("LedgeTiles"), len(r.b) - 3, 4):
@@ -76,7 +79,37 @@ class Grid:
     def tree(self, x, y):
         return (self.tileset, self.tile(x, y)) in {(0, 0x3d), (7, 0x50)}
 
+    def encounter(self, x, y):
+        # Red uses the grass encounter table on ordinary cave floors too (FOREST is tileset 3).
+        return bool(self.game.rom.maps[self.map_id].get("grass_rate") and self.walkable(x, y)
+                    and not self.water(x, y) and (self.grass_tile != 0xff and self.tile(x, y) == self.grass_tile
+                    or self.map_id >= 0x25 and self.tileset != 3))
 
+
+def surroundings(grid, start, sprites, warps, signs):
+    """The 10x9 squares the Game Boy shows around the player, as text rows."""
+    marks = {(w["x"], w["y"]): "D" for w in warps}
+    marks.update({(s["x"], s["y"]): "S" for s in signs})
+    marks.update({(s["x"], s["y"]): "O" if s["picture"] == 63 else "P" for s in sprites})
+    marks[start] = "@"
+
+    def square(x, y):
+        if (x, y) in marks:
+            return marks[x, y]
+        if grid.tile(x, y) < 0:
+            return " "
+        if grid.water(x, y):
+            return "~"
+        if grid.tree(x, y):
+            return "T"
+        if not grid.walkable(x, y):
+            return "#"
+        return "," if grid.encounter(x, y) else "."
+    sx, sy = start
+    return {"legend": "@ you, P person or item ball, O boulder, D door/stairs, S sign, # blocked, . floor, "
+                      ", tall grass or encounter floor, ~ water, T cuttable tree, blank is off this map",
+            "top_left": [sx - 4, sy - 4],
+            "rows": ["".join(square(x, y) for x in range(sx - 4, sx + 6)) for y in range(sy - 4, sy + 5)]}
 def find_path(grid, start, goal, blocked=frozenset(), exit_ok=None, grass=None, grass_cost=0):
     """Shortest walk. Tall grass costs extra so a route to a door prefers open ground."""
     if goal(*start):
@@ -126,6 +159,14 @@ def find_path(grid, start, goal, blocked=frozenset(), exit_ok=None, grass=None, 
 
 # Victory Road floor switches and the hole a boulder can drop through. Coords are from the map scripts.
 FLOOR_FEATURES = {
+    "SEAFOAM_ISLANDS_1F": [{"x": 17, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM1_BOULDER1_DOWN_HOLE"},
+                           {"x": 24, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM1_BOULDER2_DOWN_HOLE"}],
+    "SEAFOAM_ISLANDS_B1F": [{"x": 18, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM2_BOULDER1_DOWN_HOLE"},
+                            {"x": 23, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM2_BOULDER2_DOWN_HOLE"}],
+    "SEAFOAM_ISLANDS_B2F": [{"x": 19, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM3_BOULDER1_DOWN_HOLE"},
+                            {"x": 22, "y": 6, "kind": "hole", "event": "EVENT_SEAFOAM3_BOULDER2_DOWN_HOLE"}],
+    "SEAFOAM_ISLANDS_B3F": [{"x": 3, "y": 16, "kind": "hole", "event": "EVENT_SEAFOAM4_BOULDER1_DOWN_HOLE"},
+                            {"x": 6, "y": 16, "kind": "hole", "event": "EVENT_SEAFOAM4_BOULDER2_DOWN_HOLE"}],
     "VICTORY_ROAD_1F": [{"x": 17, "y": 13, "kind": "switch", "event": "EVENT_VICTORY_ROAD_1_BOULDER_ON_SWITCH"}],
     "VICTORY_ROAD_2F": [{"x": 1, "y": 16, "kind": "switch", "event": "EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH1"},
                         {"x": 9, "y": 16, "kind": "switch", "event": "EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH2"}],
@@ -135,6 +176,26 @@ FLOOR_FEATURES = {
 STRENGTH_BADGE = 0x08
 HEAL_ITEM = re.compile(
     r"POTION|FRESH WATER|SODA POP|LEMONADE|FULL RESTORE|REVIVE|ANTIDOTE|PARLYZ HEAL|AWAKENING|BURN HEAL|ICE HEAL|FULL HEAL")
+
+
+# Oak's table, left to right, in map coordinates. The balls themselves are identical in memory.
+OAK_STARTERS = {
+    (6, 3): ("Charmander", ("FIRE",)),
+    (7, 3): ("Squirtle", ("WATER",)),
+    (8, 3): ("Bulbasaur", ("GRASS", "POISON")),
+}
+
+
+def starter_fact(x, y, state, effectiveness):
+    """Which starter is in this lab ball, and how its type does against the next gym."""
+    found = OAK_STARTERS.get((x, y))
+    if not found or "EVENT_GOT_STARTER" in set(state.get("events") or ()):
+        return ""
+    species, types = found
+    from .controls import gym_sentence
+    line = f"This Poké Ball contains {species}, a {'/'.join(types)} type."
+    extra = gym_sentence(state, list(types), effectiveness, species)
+    return f"{line} {extra}".strip()
 
 
 def scripted_rival_exit(state):
@@ -157,10 +218,39 @@ class RouteMemory:
         self.said = {}
         self.pending = None
         self.lines = []
+        self.dialog = []
         self.trash_map = None
         self.traps = {}
         self.trap_sig = None
         self.pc_mode = None
+        self.boulder_map = None
+        self.boulder_best = {}
+        self.boulder_gains = 0
+        self.stuck_pushes = {}
+
+    def observe_boulders(self, state, grid, boulders):
+        """Only a new best distance on this visit counts as puzzle progress."""
+        if self.boulder_map != state["map"]:
+            self.boulder_map = state["map"]
+            self.boulder_best.clear()
+        targets = [f for f in FLOOR_FEATURES.get(state["map"], []) if f["event"] not in state["events"]]
+        points = {(f["x"], f["y"]) for f in targets}
+        occupied = {(b["x"], b["y"]) for b in boulders}
+        for boulder in boulders:
+            start = boulder["x"], boulder["y"]
+            path = find_path(grid, start, lambda x, y: (x, y) in points, occupied - {start}) if points else None
+            if path is None:
+                continue
+            key = f"{boulder['index']}:{','.join(f['event'] for f in targets)}"
+            previous = self.boulder_best.get(key)
+            distance = len(path)
+            if previous is None or distance < previous:
+                self.boulder_best[key] = distance
+                self.boulder_gains += previous is not None
+
+    @staticmethod
+    def push_key(map_name, target):
+        return f"{map_name}:{target['x']},{target['y']}:{target['direction']}"
 
     def sync(self, state):
         bag = ",".join(sorted(i["name"] for i in state["bag"]))
@@ -213,6 +303,14 @@ class RouteMemory:
 
     def hear(self, line):
         line = " ".join(str(line or "").split())
+        if line:
+            previous = self.dialog[-1] if self.dialog else ""
+            if previous and (line.startswith(previous) or previous.startswith(line)):
+                if len(line) >= len(previous):
+                    self.dialog[-1] = line
+            elif previous != line:
+                self.dialog.append(line)
+                del self.dialog[:-6]
         if not self.pending or not line:
             return
         if self.lines and line.startswith(self.lines[-1]):
@@ -238,7 +336,9 @@ class RouteMemory:
     def talk_fact(self, map_name, key, kind):
         text = self.said.get(f"{map_name}:{key}", "")[:300]
         if kind == "npc":
-            return f' Last time they said: "{text}".' if text else " Not yet talked to."
+            if not text:
+                return " Not yet talked to."
+            return f' Last time they said: "{text}".'
         if kind == "sign":
             return f' It says: "{text}".' if text else ""
         return f' Examined before: "{text}".' if text else " Not examined yet."
@@ -276,8 +376,11 @@ class RouteMemory:
         return {"blocked_exits": self.blocked_exits, "blocked_edges": self.blocked_edges,
                 "item_unused": self.item_unused, "block_sig": self.block_sig,
                 "switch_pressed": self.switch_pressed, "switch_failures": self.switch_failures,
-                "said": self.said, "pending": self.pending, "lines": self.lines, "trash_map": self.trash_map,
-                "traps": self.traps, "trap_sig": self.trap_sig, "pc_mode": self.pc_mode}
+                "said": self.said, "pending": self.pending, "lines": self.lines, "dialog": self.dialog,
+                "trash_map": self.trash_map,
+                "traps": self.traps, "trap_version": 2, "trap_sig": self.trap_sig, "pc_mode": self.pc_mode,
+                "boulder_map": self.boulder_map, "boulder_best": self.boulder_best,
+                "boulder_gains": self.boulder_gains, "stuck_pushes": self.stuck_pushes}
 
     def load(self, data):
         self.__init__()
@@ -292,10 +395,54 @@ class RouteMemory:
         self.said = dict(data.get("said", {}))
         self.pending = data.get("pending")
         self.lines = list(data.get("lines") or [])
+        self.dialog = list(data.get("dialog") or [])[-6:]
         self.trash_map = data.get("trash_map")
-        self.traps = {map_name: list(squares) for map_name, squares in (data.get("traps") or {}).items()}
+        # Older saves marked ordinary NPC conversations as impassable floor tiles.
+        if data.get("trap_version") == 2:
+            self.traps = {map_name: list(squares) for map_name, squares in (data.get("traps") or {}).items()}
         self.trap_sig = data.get("trap_sig")
         self.pc_mode = data.get("pc_mode")
+        self.boulder_map = data.get("boulder_map")
+        self.boulder_best = dict(data.get("boulder_best", {}))
+        self.boulder_gains = data.get("boulder_gains", 0)
+        self.stuck_pushes = dict(data.get("stuck_pushes", {}))
+
+
+FLY_TOWNS = {
+    "PALLET": "PALLET_TOWN", "VIRIDIAN": "VIRIDIAN_CITY", "PEWTER": "PEWTER_CITY",
+    "CERULEAN": "CERULEAN_CITY", "VERMILION": "VERMILION_CITY", "LAVENDER": "LAVENDER_TOWN",
+    "CELADON": "CELADON_CITY", "FUCHSIA": "FUCHSIA_CITY", "CINNABAR": "CINNABAR_ISLAND",
+    "INDIGO": "INDIGO_PLATEAU",
+}
+DUNGEONS = ("MT_MOON", "ROCK_TUNNEL", "DIGLETT", "VICTORY_ROAD", "SEAFOAM", "CERULEAN_CAVE",
+            "POKEMON_MANSION", "POKEMON_TOWER", "ROCKET_HIDEOUT", "SILPH_CO", "SAFARI_ZONE",
+            "POWER_PLANT", "UNDERGROUND_PATH")
+RODS = {"OLD ROD", "GOOD ROD", "SUPER ROD"}
+
+
+def service_phrase(here, there, label):
+    """How a step compares with the nearest Pokémon Center or Poké Mart."""
+    if there is None or here is None or there >= here:
+        return ""
+    if there == 0:
+        return f"Is a {label}."
+    return f"Toward the nearest {label} ({there} areas)."
+
+
+def route_fact(distance, here, *, gated=False, switch_building=False):
+    """Relative room distances, with qualified claims when live gates block the route."""
+    if here == 0:
+        return "The objective is in this area." if distance == 0 else "Leaves the current objective area."
+    if distance is None:
+        return "Does not lead toward the objective (dead end for now)." if here is not None and not gated else ""
+    gate = " (by the map layout; a gate on the way is closed right now)" if gated else ""
+    if here is None or distance < here:
+        return f"Leads toward the objective ({distance} areas away){gate}."
+    if gated and switch_building:
+        return ""
+    if distance > here:
+        return f"Leads away from the objective ({distance} areas away){gate}."
+    return f"Same distance from the objective ({distance} areas){gate}."
 
 
 def floor_phrase(map_name, hops, here):
@@ -307,10 +454,12 @@ def floor_phrase(map_name, hops, here):
         relation = " Leads toward the objective."
     elif here is not None and hops > here:
         relation = " Leads away from the objective."
+    elif here is not None:
+        relation = " Same distance from the objective."
     return f"Sets the elevator doors to lead to {map_name}. That floor is {hops} area(s) from the objective.{relation}"
 
 
-def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, stone_text=None):
+def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, stone_text=None, water_dirs=()):
     """Field item choices a player could make: teach an HM, heal, wake Snorlax, or free a full bag."""
     actions = []
     party = state["party"]
@@ -336,6 +485,12 @@ def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, sto
             desc = "Wakes a sleeping Pokémon blocking the road, such as Snorlax." if snorlax else ""
         elif name == "BICYCLE":
             desc = "" if surfing else "Ride the bicycle for faster travel."
+        elif name in RODS and water_dirs:
+            for direction in water_dirs:
+                actions.append((f"item:{name}:{direction}",
+                                f"Use {name} facing {direction}, into the water. A wild Pokémon may bite.",
+                                {"name": name, "direction": direction}))
+            continue
         elif name == "ESCAPE ROPE":
             desc = "Leave this cave or dungeon for the last Pokémon Center."
         elif "RARE CANDY" in name and party:
@@ -421,7 +576,7 @@ def boulder_actions(grid, start, boulders, blocked, warps, targets, *, known, ba
         return {(w["x"], w["y"]) for w in warps
                 if any((w["x"] + dx, w["y"] + dy) in seen for dx, dy in DIRS.values())}
 
-    floor = set(blocked) - set(edge_mats)
+    floor = set(blocked) - set(edge_mats) - {(t["x"], t["y"]) for t in targets if t["kind"] == "hole"}
     doors_now = doors(floor)
     offered = []
     for boulder in boulders:
@@ -468,7 +623,8 @@ def boulder_actions(grid, start, boulders, blocked, warps, targets, *, known, ba
             elif lost:
                 facts.append("After this push no sequence of pushes can bring this boulder onto a floor switch or into a hole.")
             mine.append((leads, opens, f"push:{boulder['index']}:{direction}", " ".join(facts), path + [(direction, x, y)],
-                         {"x": x, "y": y, "direction": direction}))
+                         {"x": x, "y": y, "direction": direction, "boulder": boulder["index"],
+                          "strands": feature is None and (not pushable or lost)}))
         if any(lead for lead, *_ in mine):
             mine = [item for item in mine if item[0] or item[1]]
         offered.extend(item[2:] for item in mine)
@@ -487,6 +643,10 @@ class Navigation:
     def update(self, state):
         self.state = state
         self.regions.update(state)
+        if state["mode"] == "overworld":
+            boulders = [s for s in self.game.sprites() if s["picture"] == 63]
+            self.memory.observe_boulders(state, self.regions.grids[state["map_id"]], boulders)
+        state["boulder_gains"] = self.memory.boulder_gains
 
     def hops(self, origin, target):
         if self.state is None:
@@ -511,6 +671,73 @@ class Navigation:
         found = [layer_a[r] for r in self.regions._targets(target) if r in layer_a]
         found += [layer_b[r] for r in self.regions.flip._targets(target) if r in layer_b]
         return min(found) if found else None
+
+    def _center_for_field_move(self):
+        """Nearest Pokémon Center when the box, not the party, can learn the missing field move."""
+        state = self.state or {}
+        if not state.get("field_move_in_box"):
+            return None
+        return self.service_target("POKECENTER")
+
+    def service_target(self, token, max_hops=None):
+        state = self.state or {}
+        origin = self.regions.landing(self.regions.at(state["map_id"], state["x"], state["y"]))
+        best = None
+        for md in self.game.rom.maps.values():
+            if token not in md["name"]:
+                continue
+            distance = self._areas(origin, md["name"])
+            if distance is None or max_hops is not None and distance > max_hops:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, md["name"])
+        return best[1] if best else None
+
+    def _nearest(self, origins, token):
+        """Areas from these rooms to the closest map whose name contains `token`."""
+        if not origins:
+            return None
+        best = None
+        for md in self.game.rom.maps.values():
+            name = md["name"]
+            if token == "_MART":
+                if not name.endswith("_MART"):
+                    continue
+            elif token not in name:
+                continue
+            distance = self._areas(origins, name)
+            if distance is not None and (best is None or distance < best):
+                best = distance
+        return best
+
+    def walking_target(self, target):
+        if self.state is not None:
+            self.state.pop("training_map", None)
+        if (self.state or {}).get("current_focus") in {"train", "catch"}:
+            training = self.training_target(target)
+            if training:
+                self.state["training_map"] = training[0]
+                return training
+        return self._center_for_field_move() or self.objective(target)
+
+    def training_target(self, preferred=None, maps=None):
+        """Reachable grass on the requested map, or the closest encounter area."""
+        state = self.state
+        origin = self.regions.landing(self.regions.at(state["map_id"], state["x"], state["y"]))
+        candidates = []
+        for mid, md in self.game.rom.maps.items():
+            grid = self.regions.grids[mid]
+            if not md.get("grass_rate") or maps is not None and md["name"] not in maps:
+                continue
+            areas = {}
+            for (x, y), area in self.regions.cells[mid].items():
+                if grid.encounter(x, y):
+                    areas.setdefault(area, (md["name"], x, y))
+            for target in areas.values():
+                distance = self._areas(origin, target)
+                if distance is not None:
+                    candidates.append((md["name"] != preferred, distance, target))
+        return min(candidates)[2] if candidates else None
 
     def field_move_needed(self, state):
         milestone = state.get("milestone") or {}
@@ -602,6 +829,29 @@ class Navigation:
         target = (state.get("active_goal") or {}).get("target_map") or state["map"]
         return floor_phrase(match["name"], self.floor_hops(match["id"], elevator, target), self.hops(elevator, target))
 
+    def fly_choice(self, state, label):
+        """Where a Fly menu town sits relative to the goal and the nearest Center."""
+        town = FLY_TOWNS.get(label)
+        if not town or self.state is None:
+            return ""
+        regions = set()
+        for map_id, md in self.game.rom.maps.items():
+            if md["name"] == town:
+                regions = set(self.regions.cells.get(map_id, {}).values())
+        if not regions:
+            return f"Fly to {town}."
+        goal = (state.get("active_goal") or {}).get("target_map") or state["map"]
+        hops = self._areas(regions, self.objective(goal))
+        center = self._nearest(regions, "POKECENTER")
+        text = f"Fly to {town}."
+        if hops is not None:
+            text += f" {hops} area(s) from the goal."
+        if center == 0:
+            text += " That town has a Pokémon Center."
+        elif center is not None:
+            text += f" Nearest Pokémon Center is {center} area(s) away."
+        return text
+
     def floor_labels(self, elevator_id, target):
         labels = []
         here = self.hops(elevator_id, target) if self.state and self.state.get("map_id") == elevator_id else None
@@ -657,9 +907,10 @@ class Navigation:
 
     def actions(self, state, goal):
         from .controls import pc_summary
-        from .regions import switch_fact
+        from .regions import HOLES, switch_fact
         g = self.game
         state["active_goal"] = goal.to_dict()
+        state.setdefault("current_focus", goal.focus)
         self.update(state)
         self.memory.sync(state)
         grid, mid = Grid(g), state["map_id"]
@@ -673,6 +924,7 @@ class Navigation:
         spins = g.rom.spinners.get(mid, {})
         holes = self.regions.special(mid) - doors
         blocked = occupied | doors | set(spins) | holes | self.memory.trap_points(state["map"])
+        state["surroundings"] = surroundings(grid, start, sprites, md["warps"], md["signs"])
         grass_tile = g.u8("wGrassTile")
 
         def grassy(x, y):
@@ -680,12 +932,18 @@ class Navigation:
 
         def travel(goal, block, exit_ok=None):
             return find_path(grid, start, goal, block, exit_ok, grass=grassy, grass_cost=1)
-        objective = self.objective(goal.target_map)
+        objective = self.walking_target(goal.target_map)
         player = self.regions.landing(self.regions.at(mid, *start))
         here = self.regions.at(mid, *start)
         here_hops = self._areas(player, objective)
         plain = self.regions.distance(player, objective, self.memory.skip())
         gated = plain is None and here_hops is not None and md["name"].startswith("POKEMON_MANSION_")
+        layout = None
+        if here_hops is None:
+            candidate = self.regions.static(*self.regions.signature, layout=True)
+            distance = candidate.distance(candidate.landing(candidate.at(mid, *start)), objective)
+            if distance is not None:
+                layout, here_hops, gated = candidate, distance, True
         if self.memory.switch_pressed == state["map"]:
             count = self.memory.switch_failures.get(state["map"], 0)
             self.memory.switch_failures[state["map"]] = count + 1 if gated else 0
@@ -716,16 +974,26 @@ class Navigation:
             names = sorted({g.rom.maps[r[0]]["name"] for r in regions})
             landing = set().union(*(self.regions.landing(r) for r in regions)) if regions else set()
             distance = self._areas(landing, objective) if landing else None
+            if layout:
+                projected = {layout.at(rmid, x, y) for rmid in {r[0] for r in regions}
+                             for (x, y), region in self.regions.cells[rmid].items() if region in regions}
+                projected = set().union(*(layout.landing(r) for r in projected)) if projected else set()
+                distance = layout.distance(projected, objective)
             text = f"Destination {', '.join(names) or 'unknown'}. Areas to goal: {distance if distance is not None else 'no known route'}."
             if rival_exit:
                 text += " Leads toward the objective: walking out starts the rival battle."
-            elif distance is not None and here_hops is not None and distance < here_hops:
-                text += " Leads toward the objective."
             elif distance is None and needed:
                 text += f" No walking route until {needed} is available."
             else:
-                text += " Unseen scripted gates may block it."
-            return text
+                fact = route_fact(distance, here_hops, gated=gated, switch_building=md["name"].startswith("POKEMON_MANSION_"))
+                if fact:
+                    text += " " + fact
+                if state.get("training_map") and distance is not None and (here_hops is None or distance < here_hops):
+                    text += " Route to tall grass for the current focus."
+            center = service_phrase(self._nearest(player, "POKECENTER"), self._nearest(landing, "POKECENTER"), "Pokémon Center")
+            mart = service_phrase(self._nearest(player, "_MART"), self._nearest(landing, "_MART"), "Poké Mart")
+            extra = " ".join(bit for bit in (center, mart) if bit)
+            return f"{text} {extra}".rstrip()
 
         for i, warp in enumerate(md["warps"]):
             pos = warp["x"], warp["y"]
@@ -786,7 +1054,9 @@ class Navigation:
             add(f"spin:{x},{y}", f"Step onto arrow at ({x},{y}), landing at {landing}. {route({region} if region else set())}",
                 "walk", travel(lambda px, py: (px, py) == (x, y), blocked - {(x, y)}))
         for x, y in holes:
-            add(f"drop:{x},{y}", f"Drop through the floor hole at ({x},{y}).",
+            destinations = {self.regions.at(self.regions.names[dest], tx, ty)
+                            for name, hx, hy, dest, tx, ty in HOLES if name == md["name"] and (hx, hy) == (x, y)}
+            add(f"drop:{x},{y}", f"Drop through the floor hole at ({x},{y}). {route(destinations)}",
                 "walk", travel(lambda px, py: (px, py) == (x, y), blocked - {(x, y)}))
         for kind, targets in [("npc", sprites), ("sign", md["signs"])]:
             for i, target in enumerate(targets):
@@ -813,23 +1083,32 @@ class Navigation:
                 elif kind == "sign":
                     facts = f"A sign.{said}" if said else "A sign, not yet read."
                 else:
+                    starter = starter_fact(x, y, state, getattr(g.rom, "effectiveness", None)) if state["map"] == "OAKS_LAB" else ""
                     facts = obj.get("item") or obj.get("trainer_class") or name
-                    facts += {"NURSE": " (heals the entire party for free)", "CLERK": " (shop clerk; buys/sells supplies)",
-                              "POKE_BALL": " (Pokémon or collectible)"}.get(name, "")
+                    if starter:
+                        facts = starter
+                    else:
+                        facts += {"NURSE": " (heals the entire party for free)", "CLERK": " (shop clerk; buys/sells supplies)",
+                                  "POKE_BALL": " (Pokémon or collectible)"}.get(name, "")
                     facts += said
+                    if (goal.focus == "progress" and state.get("current_focus", "progress") == "progress"
+                            and (objective == (state["map"], x, y)
+                                 or obj.get("trainer") and objective == (state["map"], x, y + 1))):
+                        facts += " Leads toward the objective: " + ("challenge this trainer." if obj.get("trainer") else "collect this object.")
                 add(key, f"Interact with {facts} at ({x},{y}).", "interact",
                     travel(adjacent, blocked), x=x, y=y, sprite=target.get("index"))
-        grass = g.u8("wGrassTile")
-        if grass != 0xff:
-            path = find_path(grid, start, lambda x, y: (x, y) != start and grid.tile(x, y) == grass, blocked)
-            add("grass", "Walk through grass to encounter wild Pokémon for training or catching.", "walk", path)
+        if md.get("grass_rate"):
+            path = find_path(grid, start, lambda x, y: (x, y) != start and grid.encounter(x, y), blocked)
+            add("grass", "Walk into tall grass or a cave encounter area, then pace for up to 40 steps or until a wild encounter starts, for training or catching.", "walk", path)
         explore = travel(lambda x, y: (mid, x, y) not in self.seen and abs(x - start[0]) + abs(y - start[1]) >= 4, blocked)
         add("explore", "Walk to a part of this map not yet explored.", "walk", explore)
         surfing = g.u8("wWalkBikeSurfState") == 2
         snorlax = any(g.data.sprites.get(s["picture"]) == "SNORLAX" for s in sprites)
+        water_dirs = [direction for direction, (dx, dy) in DIRS.items() if grid.water(start[0] + dx, start[1] + dy)]
         for key, description, item_target in supply_actions(
                 state, snorlax=snorlax, surfing=surfing, machine_text=self._machine_text,
-                is_key=self._is_key, unused=self.memory.item_unused, stone_text=self._stone_text):
+                is_key=self._is_key, unused=self.memory.item_unused, stone_text=self._stone_text,
+                water_dirs=water_dirs):
             add(key, description, "toss" if key == "toss" else "item", [], **item_target)
         if state["party"]:
             add("party", "Open the party menu to inspect the team or use a known field move.", "party", [])
@@ -874,7 +1153,12 @@ class Navigation:
         if "FLASH" in known:
             add("field:FLASH", "Use FLASH. Lights up a dark cave so the path is visible.", "field", [], move="FLASH")
         if "FLY" in known and state["badges"] & 4:
-            add("field:FLY", "Use FLY. Fly to a town already visited.", "field", [], move="FLY")
+            towns = ", ".join(FLY_TOWNS.values())
+            add("field:FLY", f"Use FLY. Opens the town list ({towns}) for places already visited.", "field", [], move="FLY")
+        if "TELEPORT" in known and "POKECENTER" not in md["name"]:
+            add("field:TELEPORT", "Use TELEPORT. Returns to the last Pokémon Center.", "field", [], move="TELEPORT")
+        if "DIG" in known and any(part in md["name"] for part in DUNGEONS):
+            add("field:DIG", "Use DIG. Leaves this cave or dungeon for its entrance.", "field", [], move="DIG")
         boulders = [s for s in sprites if s["picture"] == 63]
         open_targets = [dict(feature) for feature in FLOOR_FEATURES.get(md["name"], [])
                         if feature["event"] not in state["events"]
@@ -889,6 +1173,10 @@ class Navigation:
         for key, description, path, extra in boulder_actions(
                 grid, start, boulders, blocked, md["warps"], open_targets, known=known,
                 badges=state["badges"], strength_on=bool(g.u8("wStatusFlags1") & 1), edge_mats=edge_mats):
+            if key.startswith("push:"):
+                count = self.memory.stuck_pushes.get(self.memory.push_key(state["map"], extra), 0)
+                if count:
+                    description += f" Made {count} time(s) in earlier attempts; the boulder was stuck afterwards."
             add(key, description, "field" if key.startswith("field:") else "walk", path, **extra)
         if "CARD KEY" in {i["name"] for i in state["bag"]} and md["name"].startswith("SILPH_CO_"):
             for y in range(grid.h):
@@ -896,9 +1184,12 @@ class Navigation:
                     if grid.tile(x, y) in {0x18, 0x24} or md["name"] == "SILPH_CO_11F" and grid.tile(x, y) == 0x5e:
                         add(f"unlock:{x},{y}", f"Unlock the CARD KEY door at ({x},{y}).", "interact",
                             travel(lambda px, py: abs(px - x) + abs(py - y) == 1, blocked), x=x, y=y)
+        if gated and not any("Leads toward the objective" in a.description for a in result):
+            for action in result:
+                action.description = re.sub(r" Leads away from the objective \(\d+ areas away\) \(by the map layout; a gate on the way is closed right now\)\.", "", action.description)
         if any(a.key.startswith("push:") and "Leads toward the objective" in a.description for a in result):
             return [a for a in result if a.key != "explore" and not (
-                a.key.startswith(("exit:", "door:")) and "Leads toward the objective" not in a.description)]
+                a.key.startswith(("exit:", "door:")) and "Leads away from the objective" in a.description)]
         return result
 
     def execute(self, action):
@@ -927,6 +1218,34 @@ class Navigation:
                 return False
         if g.mode() != "overworld" or g.u8("wCurMap") != origin:
             return False
+        if action.key == "grass":
+            grid = Grid(g)
+            for _ in range(40):
+                if g.mode() != "overworld" or g.u8("wCurMap") != origin:
+                    break
+                x, y = g.u8("wXCoord"), g.u8("wYCoord")
+                blocked = {(s["x"], s["y"]) for s in g.sprites()} | self.regions.special(origin)
+                steps = [(direction, x + dx, y + dy) for direction, (dx, dy) in DIRS.items()
+                         if grid.encounter(x + dx, y + dy)
+                         and (x + dx, y + dy) not in blocked and (grid.tile(x, y), grid.tile(x + dx, y + dy)) not in grid.pairs]
+                if not steps or not self.execute(Action("grass:step", "", "walk", [random.choice(steps)])):
+                    break
+            return True
+        if action.key.startswith("drop:"):
+            # The fall starts a few frames after stepping onto the hole.
+            for _ in range(180):
+                if g.u8("wCurMap") != origin:
+                    return True
+                if g.mode() == "battle":
+                    return False
+                g.tick()
+            return False
+        if action.target.get("strands"):
+            dx, dy = DIRS[action.target["direction"]]
+            if any(s["index"] == action.target["boulder"] and
+                   (s["x"], s["y"]) == (action.target["x"] + dx, action.target["y"] + dy) for s in g.sprites()):
+                key = self.memory.push_key(g.rom.maps[origin]["name"], action.target)
+                self.memory.stuck_pushes[key] = self.memory.stuck_pushes.get(key, 0) + 1
         if action.kind == "interact":
             target = next((s for s in g.sprites() if s["index"] == action.target.get("sprite")), action.target)
             dx, dy = target["x"] - g.u8("wXCoord"), target["y"] - g.u8("wYCoord")

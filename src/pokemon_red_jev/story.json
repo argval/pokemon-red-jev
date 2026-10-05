@@ -79,6 +79,7 @@
   },
   {
     "id": "brock",
+    "reward_event": "EVENT_GOT_TM34",
     "goal": "Defeat Brock, the Pewter City Gym Leader (Rock/Ground Pokémon, Lv12-14). Water, Grass and Fighting moves are strong against him; Fire and Normal moves are weak against Rock.",
     "maps": [
       "PEWTER_GYM"
@@ -95,6 +96,22 @@
   },
   {
     "id": "mt_moon",
+    "needs": [
+      {
+        "items": [],
+        "events": ["EVENT_BEAT_MT_MOON_EXIT_SUPER_NERD"],
+        "map": "MT_MOON_B2F",
+        "what": "Defeat the Super Nerd guarding the fossils to open the way through Mt. Moon.",
+        "at": {"map": "MT_MOON_B2F", "x": 12, "y": 9}
+      },
+      {
+        "items": ["DOME FOSSIL", "HELIX FOSSIL"],
+        "events": ["EVENT_GOT_DOME_FOSSIL", "EVENT_GOT_HELIX_FOSSIL"],
+        "map": "MT_MOON_B2F",
+        "what": "Take one of the fossils so the Super Nerd clears the path to the Mt. Moon exit.",
+        "at": {"map": "MT_MOON_B2F", "x": 12, "y": 6}
+      }
+    ],
     "goal": "Travel east from Pewter City along Route 3 and through Mt. Moon to reach Route 4 and Cerulean City.",
     "maps": [
       "CERULEAN_CITY"
@@ -116,6 +133,7 @@
   },
   {
     "id": "misty",
+    "reward_event": "EVENT_GOT_TM11",
     "goal": "Defeat Misty, the Cerulean City Gym Leader (Water type). Electric or Grass moves are strong against her; Fire moves are weak against Water. Her team: Staryu Lv18 and Starmie Lv21 (Water/Psychic).",
     "maps": [
       "CERULEAN_GYM"
@@ -155,6 +173,7 @@
   },
   {
     "id": "surge",
+    "reward_event": "EVENT_GOT_TM24",
     "goal": "Defeat Lt. Surge at the Vermilion City Gym (Electric type; Ground moves are strong). A small tree blocks the gym entrance.",
     "maps": [
       "VERMILION_GYM"
@@ -212,6 +231,7 @@
   },
   {
     "id": "erika",
+    "reward_event": "EVENT_GOT_TM21",
     "goal": "Defeat Erika at the Celadon City Gym (Grass type; Fire, Ice, Flying moves are strong).",
     "maps": [
       "CELADON_GYM"
@@ -312,6 +332,7 @@
   },
   {
     "id": "koga",
+    "reward_event": "EVENT_GOT_TM06",
     "goal": "Defeat Koga at the Fuchsia City Gym (Poison type; Psychic and Ground moves are strong).",
     "maps": [
       "FUCHSIA_GYM"
@@ -393,6 +414,7 @@
   },
   {
     "id": "sabrina",
+    "reward_event": "EVENT_GOT_TM46",
     "goal": "Defeat Sabrina at the Saffron City Gym (Psychic type; Bug moves are strong, teleport pads connect the rooms).",
     "maps": [
       "SAFFRON_GYM"
@@ -420,6 +442,7 @@
   },
   {
     "id": "blaine",
+    "reward_event": "EVENT_GOT_TM38",
     "goal": "Defeat Blaine at the Cinnabar Island Gym (Fire type; Water and Ground moves are strong).",
     "maps": [
       "CINNABAR_GYM"
@@ -435,6 +458,7 @@
   },
   {
     "id": "giovanni",
+    "reward_event": "EVENT_GOT_TM27",
     "goal": "Defeat Giovanni at the Viridian City Gym (Ground type; Water, Grass and Ice moves are strong).",
     "maps": [
       "VIRIDIAN_GYM"

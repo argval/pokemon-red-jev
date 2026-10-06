@@ -74,6 +74,8 @@ class Agent:
         # ponytail: fixed window (~32 decisions); widen it if long no-progress cycles slip through.
         self.recent = deque(maxlen=64)
         self.idle = 0
+        # Party slots switched out against the current enemy Pokémon. Switching back only feeds it free hits.
+        self.benched = {"foe": None, "slots": set()}
         self.best_distance = None
         self.completed_goals = 0
         self.plans = 0
@@ -712,6 +714,11 @@ class Agent:
                        and not (a.target.get("pc_mode") == "DEPOSIT" and a.target.get("pc_slot") in state["team_plan"]["keep"])
                        and not (a.key.startswith("ball:") and (not wanted or self.catch_throws["count"] >= 5
                                                               or a.target.get("name") == "MASTER BALL"))]
+            enemy = (state.get("battle") or {}).get("enemy") or {}
+            foe = [enemy.get("species"), enemy.get("level"), enemy.get("max_hp")]
+            if state["mode"] == "overworld" or state["mode"] == "battle" and foe != self.benched["foe"]:
+                self.benched = {"foe": foe, "slots": set()}
+            actions = [a for a in actions if not (a.key.startswith("switch:") and a.target.get("slot") in self.benched["slots"])]
         if state["mode"] == "overworld":
             for action in actions:
                 action.description = focus_note(state["current_focus"], action.description)
@@ -766,6 +773,8 @@ class Agent:
         action = next(a for a in actions if a.key == choice)
         if choice.startswith("ball:"):
             self.catch_throws["count"] += 1
+        if choice.startswith("switch:"):
+            self.benched["slots"].add(state["battle"]["active_slot"])
         tried_key = self.trial_key(state, action)
         if state["mode"] == "overworld" and action.key != "field:STRENGTH" and not resumed:
             self.tried[tried_key] = self.tried.get(tried_key, 0) + 1

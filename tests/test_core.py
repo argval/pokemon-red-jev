@@ -16,12 +16,12 @@ from pokemon_red_jev.agent import IDLE_LIMIT, Agent, alternate
 from pokemon_red_jev.cli import Manual, load_env
 from pokemon_red_jev.controls import (Controls, catch_chance, damage, describe_effect, escape_chance, hit_chance,
                                       leave_shop_fact, menu_note, move_list_open, note_menu, party_item_note,
-                                      party_unusable, pc_summary, quantity_actions, shop_note, status_note)
+                                      party_unusable, pc_summary, quantity_actions, race, shop_note, status_note)
 from pokemon_red_jev.demo import MAPS, DemoGame, DemoJev, DemoNavigation, DemoPlanner, run_demo
 from pokemon_red_jev.goals import Goal, complete, current_milestone, describe_situation, intent_options, next_gym, story
 from pokemon_red_jev.game import Game, quiet_rows
 from pokemon_red_jev.models import (CodexPlanner, CursorPlanner, Jev, ModelError, Planner, action_instructions,
-                                    codex_failure, codex_json, cursor_failure, cursor_json, planned_goal, post_json)
+                                    _reject_loop, codex_failure, codex_json, cursor_failure, cursor_json, planned_goal, post_json)
 from pokemon_red_jev.navigation import (Action, Navigation, RouteMemory, boulder_actions, find_path,
                                         floor_phrase, scripted_rival_exit, service_phrase, starter_fact, supply_actions,
                                         surroundings)
@@ -1056,6 +1056,60 @@ class CoreChecks(unittest.TestCase):
         self.assertTrue(any(r["kind"] == "loop" for r in records))
         self.assertTrue(any("Tried here" in text for text in texts))
         self.assertIn("explore", [h["action"] for h in agent.history])
+
+    def test_battle_never_switches_back_against_the_same_enemy(self):
+        agent, _ = new_agent()
+        game = agent.game
+        weedle = dict(nickname="WEEDLE", species="WEEDLE", hp=16, max_hp=16, status="OK", level=3, moves=[])
+        game.state["party"].append(weedle)
+        game.state.update(mode="battle", battle=dict(kind="trainer", active_slot=0, enemy=dict(species="WEEDLE", level=9, max_hp=27)))
+
+        def actions(state):
+            other = 1 - state["battle"]["active_slot"]
+            return [Action("move:0", "Use TACKLE", "battle_move"), Action(f"switch:{other}", "Switch", "switch", target={"slot": other})]
+        agent.controls = SimpleNamespace(actions=actions, leave_menu=lambda: None,
+                                         execute=lambda a: game.state["battle"].update(active_slot=a.target["slot"]) if a.kind == "switch" else None)
+        offered = []
+
+        def choose(state, options):
+            offered.append(sorted(options))
+            return next((key for key in options if key.startswith("switch:")), "move:0")
+        agent.jev.choose = choose
+        for _ in range(3):
+            agent.step()
+        # Only the move is left, so it is taken without asking Jev.
+        self.assertEqual(offered, [["move:0", "switch:1"]])
+        self.assertEqual([h["action"] for h in agent.history], ["switch:1", "move:0", "move:0"])
+        game.state["battle"]["enemy"] = dict(species="PIDGEY", level=9, max_hp=27)
+        agent.step()
+        self.assertEqual(offered[-1], ["move:0", "switch:0"])
+
+    def test_battle_facts_say_who_faints_first_and_price_the_switch_in_hit(self):
+        self.assertIn("you likely win", race(20, 10, (6, 7), (3, 4), False))
+        self.assertIn("you likely faint first", race(4, 12, (5, 7), (3, 4), False))
+        self.assertIn("you likely win", race(4, 12, (5, 7), (3, 4), True))
+        self.assertEqual(race(4, 12, (0, 0), (3, 4), True), "")
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=lambda attack, defense: 1))
+        poison = dict(name="POISON STING", type="POISON", power=15, pp=35, accuracy=100, slot=0)
+        enemy = dict(species="WEEDLE", level=9, hp=12, max_hp=27, attack=12, defense=11, speed=15, special=10,
+                     status="OK", types=["BUG", "POISON"], moves=[poison])
+        squirtle = dict(slot=0, nickname="SQUIRTLE", species="SQUIRTLE", level=9, hp=3, max_hp=28, status="OK", types=["WATER"],
+                        attack=15, defense=18, speed=13, special=15,
+                        moves=[dict(name="BUBBLE", type="WATER", power=20, pp=30, accuracy=100, slot=0)])
+        weedle = dict(slot=1, nickname="WEEDLE", species="WEEDLE", level=3, hp=16, max_hp=16, status="OK", types=["BUG", "POISON"],
+                      attack=7, defense=7, speed=8, special=7, moves=[dict(poison)])
+        state = dict(map="VIRIDIAN_FOREST", mode="battle", party=[squirtle, weedle], bag=[],
+                     battle=dict(kind="trainer", player=dict(weedle), enemy=enemy, active_slot=1, moves=weedle["moves"], safari=False))
+        actions = {a.key: a.description for a in Controls(game).battle_actions(state)}
+        self.assertIn("you likely faint first", actions["move:0"])
+        self.assertIn("free hit as it comes in", actions["switch:0"])
+        self.assertIn("enough to knock it out before it acts", actions["switch:0"])
+
+    def test_only_team_goals_must_avoid_the_last_used_pokemon(self):
+        state = {"party": [{"species": "SQUIRTLE"}, {"species": "WEEDLE"}]}
+        _reject_loop({"goal": "Heal SQUIRTLE at the Pokémon Center", "focus": "heal"}, state, None)
+        with self.assertRaises(ValueError):
+            _reject_loop({"goal": "Train SQUIRTLE on Route 1", "focus": "train"}, state, None)
 
     def test_menu_loop_without_progress_closes_the_menu_and_replans(self):
         agent, records = new_agent()

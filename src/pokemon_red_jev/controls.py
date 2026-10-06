@@ -354,6 +354,23 @@ def damage(player, enemy, move, effectiveness):
     return int(base * (1.5 if move["type"] in player["types"] else 1) * effectiveness)
 
 
+def race(hp, enemy_hp, mine, theirs, first):
+    """Who faints first if both sides repeat their best hit. mine/theirs are (low, high) damage.
+
+    ponytail: average damage only; ignores accuracy, crits, stat stages, and enemies picking weaker moves.
+    """
+    hits = lambda target, low, high: -(-target * 2 // (low + high)) if high else None
+    need, survive = hits(enemy_hp, *mine), hits(hp, *theirs)
+    if need is None:
+        return ""
+    if survive is None:
+        return f" Knocks it out in about {need} hit(s) and it cannot hurt you: you win this exchange."
+    wins = need < survive or (need == survive and first)
+    return (f" Knocks it out in about {need} hit(s); its best attack knocks you out in about {survive}, "
+            f"and {'you move' if first else 'it moves'} first: "
+            f"{'you likely win this exchange' if wins else 'you likely faint first'}.")
+
+
 class Controls:
     def __init__(self, game):
         self.game = game
@@ -628,6 +645,9 @@ class Controls:
             screens = self.game.u8("wPlayerBattleStatus3")
         catching = (state.get("current_focus") == "catch" or (state.get("active_goal") or {}).get("focus") == "catch")
         balls_left = sum(item.get("qty", 0) for item in state.get("bag") or [] if str(item.get("name", "")).endswith("BALL"))
+        incoming = self._threat(b["enemy"], b["player"])
+        theirs = incoming[1::-1] if incoming else (0, 0)
+        first = (b["player"].get("speed") or 0) > (b["enemy"].get("speed") or 0)
         for move in b["moves"]:
             if not move["pp"]:
                 continue
@@ -653,6 +673,7 @@ class Controls:
                 spoiled = " Knocks it out, so it can no longer be caught." if low >= hp and b["kind"] == "wild" and catching and balls_left else ""
                 effect = " Likely KO." if low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
                 desc += f" Rough damage {low}-{high}.{effect}{spoiled} Ignores critical hits and special effects. Enemy HP {hp}."
+                desc += race(b["player"]["hp"], hp, (low, high), theirs, first)
             else:
                 desc += " Status move (no direct damage)."
                 if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
@@ -673,7 +694,7 @@ class Controls:
                     speed = f" Speed {p['speed']} vs the enemy's {b['enemy']['speed']}."
                 if status_note(p.get("status")):
                     speed = f" It is {status_note(p['status'])}{speed}"
-                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, {'/'.join(p['types'])}, HP {p['hp']}/{p['max_hp']}). {offense}{speed} Enemy type attacks have a maximum type multiplier of {threat} against it. Uses a turn.", "switch", target=p))
+                options.append(Action(f"switch:{p['slot']}", f"Switch to {p['nickname']} ({p['species']}, Lv{p['level']}, {'/'.join(p['types'])}, HP {p['hp']}/{p['max_hp']}). {offense}{speed} Enemy type attacks have a maximum type multiplier of {threat} against it. Uses a turn.{self._switch_cost(p, b['enemy'])}", "switch", target=p))
         for item in state["bag"]:
             if item["name"] in HEAL and b["player"]["hp"] < b["player"]["max_hp"]:
                 options.append(Action(f"item:{item['name']}", f"Use {item['name']} to heal up to {HEAL[item['name']]} HP. Quantity {item['qty']}. Uses a turn.", "battle_item", target={"name": item["name"], "slot": b["active_slot"]}))
@@ -753,8 +774,8 @@ class Controls:
             bits.append(text)
         return "; ".join(bits)
 
-    def _incoming(self, battle):
-        enemy, player = battle["enemy"], battle["player"]
+    def _threat(self, enemy, defender):
+        """The enemy's hardest known hit on defender, as (high, low, move name), or None."""
         best = None
         for move in enemy.get("moves") or []:
             if not move.get("power") or not move.get("pp", 1):
@@ -762,11 +783,36 @@ class Controls:
             stat = "attack" if move.get("type") in PHYSICAL else "special"
             if not enemy.get(stat):
                 continue
-            eff = self.game.rom.effectiveness(move["type"], player.get("types") or [])
-            high = damage(enemy, player, move, eff)
-            low = high * 217 // 255
+            eff = self.game.rom.effectiveness(move["type"], defender.get("types") or [])
+            high = damage(enemy, defender, move, eff)
             if best is None or high > best[0]:
-                best = (high, low, move["name"])
+                best = (high, high * 217 // 255, move["name"])
+        return best
+
+    def _switch_cost(self, mon, enemy):
+        """Switching hands the enemy a free hit on the incoming Pokémon. Then its best move races the enemy."""
+        hit = self._threat(enemy, mon)
+        if not hit:
+            return ""
+        text = f" The enemy gets a free hit as it comes in: its {hit[2]} does about {hit[1]}-{hit[0]} of its {mon['hp']} HP"
+        if hit[1] >= mon["hp"]:
+            return text + ", enough to knock it out before it acts."
+        best = None
+        if mon.get("attack") and mon.get("special"):
+            for move in mon.get("moves") or []:
+                if move.get("power") and move.get("pp"):
+                    high = damage(mon, enemy, move, self.game.rom.effectiveness(move["type"], enemy.get("types") or []))
+                    if best is None or high > best[0]:
+                        best = (high, move["name"])
+        if not best:
+            return text + "."
+        left = max(1, mon["hp"] - (hit[0] + hit[1]) // 2)
+        first = (mon.get("speed") or 0) > (enemy.get("speed") or 0)
+        return text + f". Then with {best[1]}:" + race(left, enemy.get("hp", 0), (best[0] * 217 // 255, best[0]), hit[1::-1], first)
+
+    def _incoming(self, battle):
+        player = battle["player"]
+        best = self._threat(battle["enemy"], player)
         if not best:
             return ""
         note = f"Its {best[2]} is about {best[1]}-{best[0]} damage"

@@ -206,6 +206,100 @@ class RealScenarios(unittest.TestCase):
         self.agent.milestone_id = self.game.snapshot()["milestone"]["id"]
         self.agent.jev = SimpleNamespace(choose=choose, last=None)
 
+    def test_center_healing_preserves_potions(self):
+        g = self.game
+        self.enter("VIRIDIAN_POKECENTER")
+        a = g.data.sym("wPartyMons")
+        g.memory[a + 1:a + 3] = [0, 50]
+        potion = next(i for i, name in g.rom.items.items() if name == "SUPER POTION")
+        g.memory[g.data.sym("wNumBagItems")] = 1
+        g.memory[g.data.sym("wBagItems"):g.data.sym("wBagItems") + 3] = [potion, 4, 255]
+        self.goal = Goal("Heal the party", "heal", "VIRIDIAN_POKECENTER", {"kind": "healed", "value": True}, 20)
+
+        def choose(state, options):
+            self.assertNotIn("item:SUPER POTION", options)
+            if state["mode"] == "overworld":
+                self.assertEqual(state["healing"]["allowed_slots"], [])
+                return next(k for k, desc in options.items() if "NURSE" in desc)
+            return next((k for k, desc in options.items() if desc.startswith("YES")), next(iter(options)))
+
+        self.menu_agent(choose)
+        for _ in range(30):
+            self.agent.step()
+            state = g.snapshot()
+            if self.goal.done(state) and state["mode"] == "overworld":
+                break
+        self.assertTrue(self.goal.done(state), str(self.records[-10:]))
+        self.assertEqual(state["mode"], "overworld")
+        self.assertEqual(g.bag(), [{"name": "SUPER POTION", "qty": 4}])
+        self.assertFalse(any(r.get("choice") == "item:SUPER POTION" for r in self.records))
+
+    def test_snorlax_flute_walks_to_valid_position_and_starts_battle(self):
+        from pokemon_red_jev.snorlax import SNORLAX
+        g = self.game
+        self.enter("ROUTE_12", warp=2)
+        for name, bit in g.data.events.items():
+            if name.startswith("EVENT_BEAT_ROUTE_12_TRAINER_"):
+                g.memory[g.data.sym("wEventFlags") + (bit >> 3)] |= 1 << (bit & 7)
+        flute = next(i for i, name in g.rom.items.items() if name == "POKé FLUTE")
+        g.memory[g.data.sym("wNumBagItems")] = 1
+        g.memory[g.data.sym("wBagItems"):g.data.sym("wBagItems") + 3] = [flute, 1, 255]
+        self.goal = Goal("Clear Snorlax", "progress", "ROUTE_12",
+                         {"kind": "event", "value": "EVENT_BEAT_ROUTE12_SNORLAX"}, 80)
+        def choose(state, options):
+            if state["mode"] == "overworld":
+                self.assertIn("item:POKé FLUTE", options, str((state["map"], state["x"], state["y"], options, self.records[-8:])))
+                return "item:POKé FLUTE"
+            return next(iter(options))
+        self.menu_agent(choose)
+        for _ in range(60):
+            state = g.snapshot()
+            if state.get("battle") and state["battle"]["enemy"]["species"] == "SNORLAX":
+                break
+            self.agent.step()
+        self.assertEqual((state.get("battle") or {}).get("enemy", {}).get("species"), "SNORLAX", str(self.records[-10:]))
+        self.assertIn((state["x"], state["y"]), SNORLAX["ROUTE_12"]["positions"])
+        self.assertTrue(any(r.get("choice") == "item:POKé FLUTE" for r in self.records))
+
+    def test_sleeping_snorlax_context_and_remote_collision(self):
+        self.enter("ROUTE_12")
+        state = self.game.snapshot()
+        self.agent._attach_situation(state)
+        options = self.nav.actions(state, self.goal)
+        self.assertFalse(any(a.key == "npc:1" for a in options))
+        self.assertFalse(state["situation"]["route_blocker"]["has_flute"])
+        route16 = next(mid for mid, md in self.game.rom.maps.items() if md["name"] == "ROUTE_16")
+        self.assertIn((26, 10), self.nav.regions.blocked[route16])
+        state["events"].append("EVENT_BEAT_ROUTE16_SNORLAX")
+        self.nav.update(state)
+        self.assertNotIn((26, 10), self.nav.regions.blocked[route16])
+        self.assertNotIn((26, 10), self.nav.regions.static(*self.nav.regions.signature).blocked[route16])
+
+    def test_snorlax_retreat_rechecks_old_dialog_trap(self):
+        g = self.game
+        self.enter("ROUTE_12", warp=2)
+        for name, bit in g.data.events.items():
+            if name.startswith("EVENT_BEAT_ROUTE_12_TRAINER_"):
+                g.memory[g.data.sym("wEventFlags") + (bit >> 3)] |= 1 << (bit & 7)
+        flute = next(i for i, name in g.rom.items.items() if name == "POKé FLUTE")
+        g.memory[g.data.sym("wNumBagItems")] = 1
+        g.memory[g.data.sym("wBagItems"):g.data.sym("wBagItems") + 3] = [flute, 1, 255]
+        approach = next(a for a in self.choices() if a.key == "item:POKé FLUTE")
+        self.assertTrue(self.nav.execute(approach))  # Approach without playing the Flute.
+        self.assertEqual((g.snapshot()["x"], g.snapshot()["y"]), (10, 61))
+        g.memory[g.data.sym("wNumBagItems")] = 0
+        g.memory[g.data.sym("wBagItems")] = 255
+        state = g.snapshot()
+        self.nav.memory.sync(state)
+        self.nav.memory.traps["ROUTE_12"] = ["10,60"]
+        self.goal = Goal("Return to Lavender", "progress", "LAVENDER_TOWN",
+                         {"kind": "map", "value": "LAVENDER_TOWN"}, 20)
+        self.menu_agent(lambda *_: self.fail("Retreat should be automatic"))
+        self.agent.step()
+        self.assertNotEqual(g.snapshot()["map"], "ROUTE_12", str(self.records[-8:]))
+        self.assertTrue(any(r.get("source") == "routine" and r.get("choice", "").startswith(("door:", "exit:"))
+                            for r in self.records))
+
     def test_pc_cycle_guard_closes_the_real_pc(self):
         self.enter("VIRIDIAN_POKECENTER")
         self.open_interaction("OpenPokemonCenterPC")

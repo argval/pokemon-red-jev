@@ -17,6 +17,10 @@ Codex and Cursor start a new CLI process for goal planning. This isolates the go
 
 Completion normally advances to the next story task. Low HP, expiry, stalled progress, or an unavailable focus can trigger planning. Battle/menu interruptions preserve the active task and may resume the pending walk. Route and action failure memory prevents replanning from erasing evidence of a loop. Training progress uses experience and team changes rather than HP/PP expenditure.
 
+Automatic play reserves HP-restoring items for battles and necessary field recovery. A heal focus routes to the nearest reachable Pokémon Center. Within two region transitions of a Center, field HP items are offered only when all conscious party members have at most 25% HP, or an injured poisoned Pokémon has at most 4 HP. Inside a Center, ask the nurse instead. Farther away, or with no reachable Center, field recovery is allowed at 50% HP or below. The policy is checked again in the item target menu and after each use, so routine top-ups cannot consume the remaining supplies. Status cures and revives retain their existing behavior; manual control can still use HP items freely. Planner and controller context includes the Center, its distance, and eligible party slots. Distances describe region transitions, not a guarantee that the walk is safe.
+
+Sleeping Snorlax on Routes 12 and 16 remains a collision obstacle in the route graph until its defeated/caught event is set, including when that map is not loaded. Planner and controller context identifies the blocker, Flute ownership, and the Silph Scope/Tower/Fuji prerequisites. Talking to Snorlax is omitted because it cannot clear the road. Without the Flute, automatic play near Snorlax takes a reachable exit; remembered dialog traps cannot suppress a physically open retreat there. With the Flute, the item action first walks to one of the ROM's permitted waking positions and then plays it to start the Lv30 encounter. A battle or map change during that approach interrupts item use.
+
 ## Source map
 
 | File or directory | Responsibility |

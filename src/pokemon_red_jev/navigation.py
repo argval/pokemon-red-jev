@@ -461,6 +461,7 @@ def floor_phrase(map_name, hops, here):
 
 def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, stone_text=None, water_dirs=()):
     """Field item choices a player could make: teach an HM, heal, wake Snorlax, or free a full bag."""
+    from .healing import HEAL, field_heal_allowed
     actions = []
     party = state["party"]
     injured = any(p["hp"] < p["max_hp"] for p in party)
@@ -472,6 +473,12 @@ def supply_actions(state, *, snorlax, surfing, machine_text, is_key, unused, sto
         taught = machine_text(name, party)
         if taught is not None:
             desc = taught
+        elif name in HEAL:
+            targets = [p for p in party if 0 < p["hp"] < p["max_hp"] and field_heal_allowed(state, p)]
+            desc = (f"Restores up to {HEAL[name]} HP. {qty} left. Eligible targets: "
+                    + ", ".join(p.get("nickname") or p.get("species", "?") for p in targets) + ".") if targets else ""
+            if desc and state.get("healing"):
+                desc += " Field recovery exception; save remaining supplies for battles."
         elif HEAL_ITEM.search(name):
             hurt = [f"{p.get('nickname') or p.get('species')} is {str(p.get('status')).lower()}"
                     for p in party if p.get("status") not in (None, "OK")]
@@ -713,6 +720,10 @@ class Navigation:
     def walking_target(self, target):
         if self.state is not None:
             self.state.pop("training_map", None)
+        if (self.state or {}).get("current_focus") == "heal":
+            center = (self.state.get("healing") or {}).get("center") or self.service_target("POKECENTER")
+            if center:
+                return center
         if (self.state or {}).get("current_focus") in {"train", "catch"}:
             training = self.training_target(target)
             if training:
@@ -908,6 +919,7 @@ class Navigation:
     def actions(self, state, goal):
         from .controls import pc_summary
         from .regions import HOLES, switch_fact
+        from .snorlax import SNORLAX, snorlax_context
         g = self.game
         state["active_goal"] = goal.to_dict()
         state.setdefault("current_focus", goal.focus)
@@ -924,6 +936,14 @@ class Navigation:
         spins = g.rom.spinners.get(mid, {})
         holes = self.regions.special(mid) - doors
         blocked = occupied | doors | set(spins) | holes | self.memory.trap_points(state["map"])
+        blocker = snorlax_context(state, sprites)
+        near_snorlax = blocker and abs(start[0] - blocker["x"]) + abs(start[1] - blocker["y"]) <= 2
+        if blocker:
+            state.setdefault("situation", {})["route_blocker"] = blocker
+        if near_snorlax:
+            # Recheck exits against current collision instead of trapping the player beside Snorlax
+            # because an unrelated menu/dialog once interrupted their retreat.
+            blocked = occupied | doors | set(spins) | holes
         state["surroundings"] = surroundings(grid, start, sprites, md["warps"], md["signs"])
         grass_tile = g.u8("wGrassTile")
 
@@ -963,7 +983,8 @@ class Navigation:
             return [f"{here[0]}:{here[1]}>{region[0]}:{region[1]}" for region in regions if region is not None]
 
         def add(key, description, kind, path, edges=(), **target):
-            if path is None or self.memory.hidden(state["map"], key):
+            retreat = near_snorlax and not blocker["has_flute"] and key.startswith(("exit:", "door:"))
+            if path is None or self.memory.hidden(state["map"], key) and not retreat:
                 return
             if edges:
                 target["edges"] = list(edges)
@@ -1068,6 +1089,8 @@ class Navigation:
                         px + 2 * dx == x and py + 2 * dy == y and grid.tile(px + dx, py + dy) in grid.counters
                         for dx, dy in DIRS.values())
                 name = g.data.sprites.get(target.get("picture"), "sign")
+                if name == "SNORLAX":
+                    continue  # Talking never wakes it; offer the positioned Flute action instead.
                 obj = next((o for o in md["objects"] if o["index"] == target.get("index")), {})
                 key = f"{kind}:{target.get('index', i)}"
                 # The lab rival is a door script. Talking to him loops without starting the battle.
@@ -1109,7 +1132,12 @@ class Navigation:
                 state, snorlax=snorlax, surfing=surfing, machine_text=self._machine_text,
                 is_key=self._is_key, unused=self.memory.item_unused, stone_text=self._stone_text,
                 water_dirs=water_dirs):
-            add(key, description, "toss" if key == "toss" else "item", [], **item_target)
+            path = []
+            if item_target.get("name") == "POKé FLUTE" and blocker:
+                positions = SNORLAX[state["map"]]["positions"]
+                path = travel(lambda x, y: (x, y) in positions, blocked)
+                description = "Walk beside sleeping Snorlax, then use the Poké Flute to start its Lv30 wild battle."
+            add(key, description, "toss" if key == "toss" else "item", path, **item_target)
         if state["party"]:
             add("party", "Open the party menu to inspect the team or use a known field move.", "party", [])
         for i, hidden in enumerate(g.rom.hidden.get(mid, [])):

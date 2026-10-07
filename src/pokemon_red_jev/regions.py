@@ -3,6 +3,7 @@
 from collections import deque
 
 from .navigation import DIRS, Grid
+from .snorlax import SNORLAX
 
 HOLES = [("POKEMON_MANSION_3F", 16, 14, "POKEMON_MANSION_1F", 16, 14),
          ("POKEMON_MANSION_3F", 17, 14, "POKEMON_MANSION_1F", 16, 14),
@@ -106,20 +107,32 @@ class Regions:
         self.flip = None
         self._static_cache = {}
         self._mansion_cache = {}
+        self.snorlax_cleared = frozenset()
+
+    def fixed_blocks(self, md, *, layout=False):
+        site = SNORLAX.get(md["name"])
+        sleeping = site and site["event"] not in self.snorlax_cleared
+        return {(o["x"], o["y"]) for o in md["objects"]
+                if (o["picture"] == 63 and not layout) or (o["picture"] == 67 and sleeping)}
 
     def update(self, state):
         known = {m["name"] for p in state["party"] for m in p["moves"]}
         cut, surf = "CUT" in known and bool(state["badges"] & 2), "SURF" in known and bool(state["badges"] & 16)
         switch = "EVENT_MANSION_SWITCH_ON" in state["events"]
         signature = cut, surf, switch
-        rebuild = signature != self.signature
+        cleared = frozenset(site["event"] for site in SNORLAX.values() if site["event"] in state["events"])
+        rebuild = signature != self.signature or cleared != self.snorlax_cleared
+        if cleared != self.snorlax_cleared:
+            self.snorlax_cleared = cleared
+            self._static_cache.clear()
+            self._mansion_cache.clear()
         if rebuild:
             self.signature, self.live_key = signature, None
             self.grids = {mid: Grid(self.game, mid, cut=cut, surf=surf,
                                    overrides={y * md["width"] + x: on if switch else off
                                               for y, x, off, on in MANSION.get(md["name"], [])})
                           for mid, md in self.maps.items()}
-            self.blocked = {mid: {(o["x"], o["y"]) for o in md["objects"] if o["picture"] == 63}
+            self.blocked = {mid: self.fixed_blocks(md)
                             for mid, md in self.maps.items()}
             self.flip = self.static(cut, surf, not switch)
         if state["mode"] == "overworld":
@@ -131,7 +144,7 @@ class Regions:
             if key != self.live_key:
                 old = self.live_key[0] if self.live_key else None
                 if old is not None and old != mid:
-                    self.blocked[old] = {(o["x"], o["y"]) for o in self.maps[old]["objects"] if o["picture"] == 63}
+                    self.blocked[old] = self.fixed_blocks(self.maps[old])
                     self.label(old)
                 self.grids[mid], self.blocked[mid], self.live_key = live, occupied, key
                 if not rebuild:
@@ -312,11 +325,12 @@ class Regions:
         key = (cut, surf, switch, layout)
         if key not in self._static_cache:
             other = Regions(self.game)
+            other.snorlax_cleared = self.snorlax_cleared
             other.grids = {mid: Grid(self.game, mid, cut=cut, surf=surf,
                                     overrides={y * md["width"] + x: on if switch else off
                                                for y, x, off, on in MANSION.get(md["name"], [])})
                            for mid, md in self.maps.items()}
-            other.blocked = {mid: {(o["x"], o["y"]) for o in md["objects"] if o["picture"] == 63 and not layout}
+            other.blocked = {mid: other.fixed_blocks(md, layout=layout)
                              for mid, md in self.maps.items()}
             for mid in other.maps:
                 other.label(mid)

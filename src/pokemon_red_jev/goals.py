@@ -564,7 +564,7 @@ def intent_options(state, shop_money=None, objective_hops=None):
     box = state.get("box") or []
     healing = [item for item in bag if re.search(r"POTION|FRESH WATER|SODA POP|LEMONADE|FULL RESTORE|REVIVE", item["name"])]
     carried = ", ".join(f"{item['name']} x{item['qty']}" for item in healing) or "none"
-    heal_note = f" Healing items in the bag: {carried} (they heal without a walk to a Pokémon Center)."
+    heal_note = f" Healing items in the bag: {carried}. Save HP-restoring items for battles or necessary field recovery."
     options = dict(INTENTS)
     options["catch"] = (f"{INTENTS['catch']} Team size {len(party)}/6. Poké Balls in bag: {balls}."
                         + (" Catching needs a Poké Ball: with none in the bag, wild Pokémon can only be fought." if balls == 0 else "")

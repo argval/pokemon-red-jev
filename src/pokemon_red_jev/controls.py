@@ -3,11 +3,10 @@
 import re
 
 from .goals import next_gym
+from .healing import HEAL, field_heal_allowed
 from .navigation import FLY_TOWNS, Action
 
 PHYSICAL = {"NORMAL", "FIGHTING", "FLYING", "POISON", "GROUND", "ROCK", "BUG", "GHOST"}
-HEAL = {"POTION": 20, "SUPER POTION": 50, "HYPER POTION": 200, "MAX POTION": 999, "FULL RESTORE": 999,
-        "FRESH WATER": 50, "SODA POP": 60, "LEMONADE": 80}
 # Gen 1 stat-stage ratios, stage 1..13. Stage 7 is unchanged.
 STAGE = [(25, 100), (28, 100), (33, 100), (40, 100), (50, 100), (66, 100), (1, 1),
          (15, 10), (2, 1), (25, 10), (3, 1), (35, 10), (4, 1)]
@@ -565,6 +564,9 @@ class Controls:
             pokemon = next((p for p in state["party"] if p["nickname"] == label), None)
             if pokemon:
                 if state["mode"] == "battle" and pokemon["hp"] == 0:
+                    continue
+                if (state["mode"] != "battle" and state.get("using_item") in HEAL
+                        and not field_heal_allowed(state, pokemon)):
                     continue
                 unable = screen["cursor"][0] == 0 and pokemon["slot"] * 2 + 1 < len(screen["rows"]) and "NOT ABLE" in screen["rows"][pokemon["slot"] * 2 + 1]
                 facts += f". {pokemon['species']} Lv{pokemon['level']} HP {pokemon['hp']}/{pokemon['max_hp']}; moves {[m['name'] for m in pokemon['moves']]}"

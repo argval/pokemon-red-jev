@@ -17,8 +17,10 @@ from .controls import move_list_open, note_menu, party_unusable
 from .goals import (FOCUS_TTL, Goal, catch_reason, describe_situation, fallback_goal, focus_note,
                     intent_key, intent_options, team_plan, wild_field_move_learners)
 from .llm.context_builder import formatPartyForPrompt
+from .healing import field_healing
 from .models import ModelError
 from .navigation import Action
+from .snorlax import snorlax_context
 from .state.party import getPartySnapshot
 
 
@@ -229,6 +231,10 @@ class Agent:
         rom = getattr(self.game, "rom", None)
         state["situation"] = describe_situation(
             state, getattr(rom, "species", None), getattr(rom, "items", None), getattr(rom, "effectiveness", None))
+        if state["mode"] not in {"boot", "battle"} and hasattr(self.game, "sprites"):
+            blocker = snorlax_context(state, self.game.sprites())
+            if blocker:
+                state["situation"]["route_blocker"] = blocker
         state["field_move_in_box"] = bool(state["situation"].get("withdraw_field_move"))
         state["team_plan"] = team_plan(state, getattr(rom, "effectiveness", None))
         state["situation"]["team_plan"] = state["team_plan"]
@@ -457,6 +463,12 @@ class Agent:
             return actions[0]
         if getattr(self.jev, "manual", False):
             return None
+        blocker = (state.get("situation") or {}).get("route_blocker")
+        if (state["mode"] == "overworld" and blocker and not blocker["has_flute"]
+                and abs(state["x"] - blocker["x"]) + abs(state["y"] - blocker["y"]) <= 2):
+            exits = [a for a in actions if a.key.startswith(("exit:", "door:"))]
+            if exits:
+                return min(exits, key=lambda a: ("Leads toward the objective" not in a.description, len(a.path)))
         action = self._team_action(state, actions)
         if action and self.failures.get(f"{state['map']}:{state['x']},{state['y']}:{state['mode']}:{action.key}", 0) < 3:
             return action
@@ -544,7 +556,21 @@ class Agent:
             brief["recovery"] = state["recovery"]
         if state.get("situation"):
             brief["situation"] = state["situation"]
+        if state.get("healing"):
+            brief["healing"] = state["healing"]
         return brief
+
+    def _attach_healing(self, state):
+        if state["mode"] in {"battle", "boot", "busy"} or getattr(self.jev, "manual", False):
+            return
+        center, hops = None, None
+        if hasattr(self.navigation, "service_target"):
+            if getattr(self.navigation, "state", None) is None:
+                self.navigation.update(state)
+            center = self.navigation.service_target("POKECENTER")
+            if center:
+                hops = self.navigation.hops(state["map_id"], center)
+        state["healing"] = field_healing(state, center, hops)
 
     def planner_catalog(self, state):
         """Identifiers the planner may use: nearby maps, the story step's maps, and its success event."""
@@ -653,6 +679,7 @@ class Agent:
         self._show(state)
         if state["mode"] == "overworld":
             self.navigation.update(state)
+        self._attach_healing(state)
         milestone_id = (state.get("milestone") or {}).get("id")
         hp_fraction = (sum(p["hp"] for p in state["party"]) / max(1, sum(p["max_hp"] for p in state["party"]))
                        if state["party"] else 1)
@@ -800,7 +827,7 @@ class Agent:
         if state["mode"] == "overworld" and action.kind in {"item", "toss"} and hasattr(self.navigation, "memory"):
             self.pending_item = {"name": action.target.get("name", "BAG"), "before": self.supply_key(state)}
             self.item_fresh = True
-        if action.kind == "field":
+        if action.kind == "field" or action.kind == "item" and action.path:
             if self.navigation.execute(action):
                 self.controls.execute(action)
         elif action.kind in {"walk", "door", "interact"}:

@@ -71,6 +71,10 @@ def action_instructions(state):
         return _with_focus(
             "You are playing Pokémon Red. active_goal is the current errand. "
             "Follow current_focus for this decision; route facts describe its destination. "
+            "For healing, prefer the nearest reachable Pokémon Center. healing explains which emergency "
+            "targets may use HP-restoring items outside battle. Do not spend potions on routine top-ups. "
+            "situation.route_blocker identifies sleeping Snorlax and the Poké Flute prerequisite. "
+            "Without the Flute, take an open route away from Snorlax; talking and party menus cannot clear it. "
             "surroundings.rows is the screen around the player (see its legend); option coordinates use the same map squares. "
             "When training or catching, reach the marked encounter area and use the grass action. "
             "Keep the party alive. Take a one-turn detour when the facts show a clear gain: "
@@ -194,6 +198,8 @@ Return ONE JSON object, with no markdown, using exactly:
 state.map is where the player is standing. state.nearby_maps lists the maps within a few rooms and how many areas away they are.
 state.milestone is the current story step. Aim at the next room toward it, not the whole milestone.
 state.party gives each Pokemon's slot, species, level, HP/maxHP, status, moves with PP, XP, and a usability flag. state.party_text is the same team as short readable lines. state.bag is what they are carrying.
+state.healing names the nearest reachable Pokémon Center and field-healing exceptions. Prefer free Center healing; reserve HP-restoring items for battles or those exceptions. For a heal goal, use the Center as target_map and healed=true as success when it is in the supplied catalog.
+state.situation.route_blocker identifies sleeping Snorlax, whether the Poké Flute is owned, and how to obtain it. Without the Flute, backtrack through an open route toward the current milestone rather than choosing another Snorlax interaction or a party-menu goal. Get the Flute before planning to clear that road; using it beside Snorlax starts a Lv30 wild battle.
 previous_goal says what was just tried and how it ended. recent_actions are the last moves.
 catalog.maps, catalog.events, catalog.items, and catalog.interactions are the only legal identifiers.
 target_map must be the current map or one of nearby_maps or a map named by the milestone.

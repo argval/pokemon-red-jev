@@ -26,7 +26,7 @@ from pokemon_red_jev.navigation import (Action, Navigation, RouteMemory, boulder
                                         floor_phrase, scripted_rival_exit, service_phrase, starter_fact, supply_actions,
                                         surroundings)
 from pokemon_red_jev.regions import Regions, switch_distances, switch_fact, switch_reach
-from pokemon_red_jev.stage import LINE_H, PANEL_H, PanelRenderer, overlay_lines
+from pokemon_red_jev.stage import ACCENT, DIM, FG, FRAME, H, RULE, RX, W, Panel
 
 
 def new_agent(planner=None):
@@ -247,47 +247,47 @@ class CoreChecks(unittest.TestCase):
                 self.assertFalse(checkpoint["badge_earned"])
                 self.assertFalse(checkpoint["tm_received"])
 
-    def test_overlay_matches_stream_panel_sections_and_font(self):
+    def test_panel_draws_the_dashboard_from_game_facts(self):
         state = DemoGame().snapshot()
         state["milestone"] = current_milestone(state)
-        state["badges"] = 0b101
-        controller = SimpleNamespace(calls=1200, input_tokens=1_000_000, last={
-            "purpose": "overworld", "picked": "talk", "probabilities": {"talk": 0.72, "walk": 0.2}})
+        state.update(badges=0b101, active_goal={"goal": "Speak to Professor Oak"})
+        controller = SimpleNamespace(calls=1200, input_tokens=1_000_000, model="jev-latest", latency_ms=312, last={
+            "purpose": "overworld", "picked": "walk", "probabilities": {"walk": 0.2, "talk": 0.72, "bad": "x"}})
+        panel = Panel(bytes([0xFF] * 8), 0, {0x80: "A"})
         with patch.dict(os.environ, {"JEV_PRICE_PER_M": "0.042"}):
-            lines = overlay_lines(state, controller, 36)
-        self.assertEqual(lines[0], "# JEV PLAYS POKEMON RED")
-        self.assertEqual(lines[1], "~ 2 badges | milestone 0/33")
-        self.assertEqual(lines[2], "~ 1,200 jev calls | 1,000,000 tokens")
-        self.assertEqual(lines[3], "~ total cost: $0.042 USD")
-        self.assertLess(lines.index("# MILESTONE"), lines.index("# GOAL"))
-        self.assertIn("~ none yet", lines)
-        state["active_goal"] = {"goal": "Speak to Professor Oak"}
-        with patch.dict(os.environ, {"JEV_PRICE_PER_M": "0.042"}):
-            lines = overlay_lines(state, controller, 36)
-        milestone_at, goal_at = lines.index("# MILESTONE"), lines.index("# GOAL")
-        self.assertLess(milestone_at, goal_at)
-        self.assertTrue(any(state["milestone"]["goal"].split()[0] in line for line in lines[milestone_at:goal_at]))
-        self.assertEqual(lines[goal_at + 1], "Speak to Professor Oak")
-        self.assertLessEqual(len(lines), PANEL_H // LINE_H)
-        state["party"] = [dict(nickname=f"N{i}", species="PIDGEY", level=12, hp=30, max_hp=40) for i in range(6)]
-        state["milestone"]["goal"] = "Defeat Brock, the Pewter City Gym Leader (Rock/Ground Pokémon, Lv12-14). Water, Grass and Fighting moves are strong against him."
-        state["active_goal"] = {"goal": "Enter Pewter Gym and fight Brock after healing at the Pokemon Center so the party is ready."}
-        controller.last = {"purpose": "overworld", "picked": "door:0", "probabilities": {"door:0": 0.5, "npc:1": 0.3, "explore": 0.2}}
-        full = overlay_lines(state, controller, 36)
-        self.assertLessEqual(len(full), PANEL_H // LINE_H)
-        self.assertLess(full.index("# JEV DECISION (overworld)"), full.index("~  50% door:0"))
-        self.assertIn("# WHERE", lines)
-        self.assertIn("ROUTE 1", lines)
-        team = next(line for line in lines if "BULBASAUR" in line)
-        self.assertIn("BULBASAUR (JEV)", team)
-        self.assertIn("Lv5", team)
-        self.assertIn("8/20", team)
-        self.assertLess(lines.index("# JEV DECISION (overworld)"), lines.index("~  72% talk"))
-        self.assertLess(lines.index("~  72% talk"), lines.index("~  20% walk"))
-        image = PanelRenderer(bytes([0xFF] * 8), 0, {0x80: "A"}).render(["# A", "~ A"])
+            image = panel.draw(state, controller)
+        drawn = panel.drawn
+        self.assertEqual(len(image), W * H * 4)
+        self.assertIn(("R O U T E   1", FG), drawn)
+        self.assertIn(("2/8", ACCENT), drawn)
+        self.assertIn(("1.2K", FG), drawn)
+        self.assertIn(("1,000,000", FG), drawn)
+        self.assertIn(("$0.042", FG), drawn)
+        self.assertIn(("312MS", FG), drawn)
+        self.assertIn(("Speak to Professor Oak", FG), drawn)
+        self.assertTrue(any(state["milestone"]["goal"].split()[0] in text for text, _ in drawn))
+        # Odds are ranked; the executed option is highlighted even when it was not Jev's top pick.
+        texts = [text for text, _ in drawn]
+        self.assertLess(texts.index("talk"), texts.index("walk"))
+        self.assertIn(("talk", DIM), drawn)
+        self.assertIn(("walk", FG), drawn)
+        self.assertIn(("walk", ACCENT), drawn)
+        self.assertNotIn("bad", texts)
+        self.assertIn(("BULBASAUR", FG), drawn)
+        self.assertIn(("Lv5", DIM), drawn)
+        self.assertIn(("8/20", FG), drawn)
         self.assertEqual(list(image[0:4]), [21, 21, 20, 255])
-        self.assertEqual(list(image[(1 * 288) * 4:(1 * 288) * 4 + 3]), [124, 196, 155])
-        self.assertEqual(list(image[(11 * 288) * 4:(11 * 288) * 4 + 3]), [154, 154, 146])
+        frame = (FRAME[1] * W + FRAME[0]) * 4
+        self.assertEqual(list(image[frame:frame + 3]), list(RULE))
+        glyph = (48 * W + RX + 8) * 4  # the "A" of the BADGES label; the test font's A is a solid block
+        self.assertEqual(list(image[glyph:glyph + 3]), list(DIM))
+        # Oversized values stay inside the buffer.
+        state.update(map="X" * 90, agent_status="Y" * 90, party=[dict(species="Z" * 20, level=100, hp=999, max_hp=999, status="POISON")] * 6)
+        controller.last = {"purpose": "p" * 50, "picked": "q" * 60, "probabilities": {"r" * 40: 2}}
+        controller.input_tokens = 10 ** 12
+        self.assertEqual(len(panel.draw(state, controller)), W * H * 4)
+        self.assertEqual(len(panel.draw({}, None)), W * H * 4)
+        self.assertIn(("starting...", DIM), panel.drawn)
 
     def test_budget_replans_but_never_counts_timeout_as_success(self):
         agent, records = new_agent()

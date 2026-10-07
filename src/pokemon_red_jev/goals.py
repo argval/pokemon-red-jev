@@ -334,6 +334,10 @@ def catch_reason(state, enemy, effectiveness=None):
         return None
     if len(state.get("party") or []) >= 6 and len(state.get("box") or []) >= 20:
         return None
+    move = state.get("field_move_needed")
+    hm = FIELD_MOVES.get(move, (None,))[0]
+    if hm and _can_learn(enemy, hm) and not any(_can_learn(p, hm) for p in owned):
+        return f"Can learn {hm} ({move}), which the objective needs and no owned Pokémon can learn."
     if len(owned) < 2:
         return "Add a backup so the starter is not the only battler."
     types = set(enemy.get("types") or [])
@@ -435,6 +439,22 @@ def field_move_report(state, species=None, items=None):
     if withdraw:
         text += " First step: withdraw a Pokémon that can learn it at a Pokémon Center PC, then teach it."
     return {"text": text, "withdraw": withdraw}
+
+
+def wild_field_move_learners(state, maps, species, nearby):
+    """Wild species on nearby maps that can learn the missing Cut or Surf, by map. Empty when someone owned can."""
+    hm = FIELD_MOVES.get(state.get("field_move_needed"), (None,))[0]
+    owned = [*(state.get("party") or []), *(state.get("box") or [])]
+    if not hm or any(_can_learn(p, hm) for p in owned):
+        return {}
+    found = {}
+    for record in (maps or {}).values():
+        if record.get("name") in nearby:
+            for wild in record.get("wild") or []:
+                sp = (species or {}).get(wild["species_id"]) or {}
+                if _can_learn(sp, hm):
+                    found.setdefault(sp["name"], set()).add(record["name"])
+    return {name: sorted(where) for name, where in sorted(found.items())}
 
 
 def describe_situation(state, species=None, items=None, effectiveness=None):

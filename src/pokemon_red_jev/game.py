@@ -451,7 +451,7 @@ class Game:
             return dict(species=sp.get("name", "?"), types=sp.get("types", []), level=self.memory[a + 14],
                         hp=self.be16(a + 1), max_hp=self.be16(a + 15), status=status(self.memory[a + 4]),
                         attack=self.be16(a + 17), defense=self.be16(a + 19), speed=self.be16(a + 21), special=self.be16(a + 23),
-                        catch_rate=sp.get("catch_rate", 0), dex=sp.get("dex", 0),
+                        catch_rate=sp.get("catch_rate", 0), dex=sp.get("dex", 0), learnable_hms=hm_names(sp),
                         moves=self.moves_at(a + 8, a + 25))
         player, enemy = mon("wBattleMon"), mon("wEnemyMon")
         return dict(kind="wild" if self.u8("wIsInBattle") == 1 else "trainer", player=player, enemy=enemy,

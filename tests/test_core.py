@@ -14,11 +14,11 @@ import zipfile
 
 from pokemon_red_jev.agent import IDLE_LIMIT, Agent, alternate
 from pokemon_red_jev.cli import Manual, load_env
-from pokemon_red_jev.controls import (Controls, catch_chance, damage, describe_effect, escape_chance, hit_chance,
+from pokemon_red_jev.controls import (Controls, catch_chance, damage, describe_effect, escape_chance, hit_chance, stage_note,
                                       leave_shop_fact, menu_note, move_list_open, note_menu, party_item_note,
                                       party_unusable, pc_summary, quantity_actions, race, shop_note, status_note)
 from pokemon_red_jev.demo import MAPS, DemoGame, DemoJev, DemoNavigation, DemoPlanner, run_demo
-from pokemon_red_jev.goals import Goal, complete, current_milestone, describe_situation, intent_options, next_gym, story
+from pokemon_red_jev.goals import Goal, complete, current_milestone, describe_situation, fallback_goal, intent_options, next_gym, story
 from pokemon_red_jev.game import Game, quiet_rows
 from pokemon_red_jev.models import (CodexPlanner, CursorPlanner, Jev, ModelError, Planner, action_instructions,
                                     _reject_loop, codex_failure, codex_json, cursor_failure, cursor_json, planned_goal, post_json)
@@ -880,10 +880,20 @@ class CoreChecks(unittest.TestCase):
         ball = next(a.description for a in controls.battle_actions(state) if a.key.startswith("ball:"))
         self.assertIn("Likely KO", text)
         self.assertNotIn("no longer be caught", text)
-        catching = next(a.description for a in controls.battle_actions(dict(state, current_focus="catch")) if a.key == "move:0")
+        # A catch focus alone must not warn against a KO: with no ball on offer, that leaves only stalling moves.
+        unwanted = next(a.description for a in controls.battle_actions(dict(state, current_focus="catch")) if a.key == "move:0")
+        self.assertNotIn("no longer be caught", unwanted)
+        self.assertNotIn("ends the catch", action_instructions({"mode": "battle", "current_focus": "catch", "battle": {"kind": "wild"}}))
+        self.assertIn("status moves", action_instructions({"mode": "battle", "current_focus": "catch", "battle": {"kind": "wild"}}))
+        catchable = dict(state, battle=dict(state["battle"], catchable=True))
+        catching = next(a.description for a in controls.battle_actions(catchable) if a.key == "move:0")
         self.assertIn("no longer be caught", catching)
-        self.assertIn("ends the catch", action_instructions({"mode": "battle", "current_focus": "catch", "battle": {"kind": "wild"}}))
+        self.assertIn("ends the catch", action_instructions({"mode": "battle", "battle": {"kind": "wild", "catchable": True}}))
         self.assertIn("Hit chance right now", text)
+        floored = {"wEnemyMonDefenseMod": 1, "wPlayerMonDefenseMod": 13}
+        self.assertIn("does nothing", stage_note(0x13, lambda name: floored.get(name, 7)))  # TAIL WHIP at -6
+        self.assertIn("does nothing", stage_note(0x0B, lambda name: floored.get(name, 7)))  # WITHDRAW at +6
+        self.assertEqual(stage_note(0x12, lambda name: floored.get(name, 7)), "")  # GROWL still works
         self.assertIn("Estimated catch chance", ball)
         self.assertIn("NEW species", ball)
         self.assertIn("not on your team", ball)
@@ -1148,6 +1158,31 @@ class CoreChecks(unittest.TestCase):
         with self.assertRaisesRegex(ModelError, "Unknown target map"):
             planned_goal(lambda context: bad, state, catalog, None, "Test", lambda *args, **kwargs: None)
 
+    def test_planner_catch_goal_ends_only_on_a_new_catch(self):
+        # Planners proxied catches with "reach the route" or "reach Lv31": those ended at once, without a catch.
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        catalog = agent.catalog(state)
+        good = DemoPlanner().plan(state, catalog, None).to_dict()
+        catch = {**good, "focus": "catch", "target_map": state["map"], "success": {"kind": "map", "value": state["map"]},
+                 "justification": "GRASS coverage at Lv14 that can learn CUT"}
+        goal, _ = planned_goal(lambda context: catch, dict(state, owned_count=2), catalog, None, "Test",
+                               lambda *args, **kwargs: None)
+        self.assertEqual(goal.success, {"kind": "owned_count", "value": 3})
+
+    def test_blocked_story_fallback_lets_jev_pick_instead_of_replanning(self):
+        agent, _ = new_agent()
+        state = agent.game.snapshot()
+        blocked = {"catch": "Catch", "heal": "Heal"}  # progress needs CUT, so it isn't offered
+        agent._pick_intent = lambda state, options: "catch"
+        with patch("pokemon_red_jev.agent.intent_options", return_value=dict(blocked)):
+            agent.goal = fallback_goal(state)
+            self.assertEqual(agent._choose_intent(state), "catch")
+            self.assertEqual(agent.goal, fallback_goal(state))
+            agent.goal, agent.intent = Goal("Walk to the gym", "progress", state["map"], {"kind": "badge", "value": 3}), None
+            self.assertIsNone(agent._choose_intent(state))  # a planned goal with a blocked focus still ends
+            self.assertEqual(agent.replan_reason, "focus unavailable")
+
     def test_surroundings_show_the_screen_around_the_player(self):
         grid = SimpleNamespace(tile=lambda x, y: 0 if 0 <= x < 6 and 0 <= y < 6 else -1,
                                water=lambda x, y: (x, y) == (5, 5), tree=lambda x, y: False,
@@ -1321,6 +1356,43 @@ class CoreChecks(unittest.TestCase):
         self.assertIn("revive:MAX REVIVE:2", actions)
         self.assertEqual(actions["revive:MAX REVIVE:2"].target["name"], "MAX REVIVE")
         self.assertNotEqual(actions["revive:REVIVE:2"].key, actions["revive:MAX REVIVE:2"].key)
+
+    def test_disabled_move_is_not_offered_and_struggle_follows(self):
+        # Gen 1 reopens the move menu without a turn passing when the disabled move is picked: an endless loop.
+        player = dict(level=20, attack=40, defense=20, special=20, types=["WATER"], hp=30, max_hp=30, status="OK", slot=0)
+        enemy = dict(level=15, attack=20, defense=20, special=20, types=["PSYCHIC"], hp=40, max_hp=40,
+                     status="OK", species="DROWZEE", catch_rate=190, dex=96)
+        moves = [dict(name="TACKLE", type="NORMAL", power=35, pp=0, accuracy=95, slot=0),
+                 dict(name="BUBBLE", type="WATER", power=20, pp=20, accuracy=100, slot=1),
+                 dict(name="BITE", type="NORMAL", power=60, pp=10, accuracy=100, slot=2)]
+        memory = {"wPlayerDisabledMove": 0x34}  # slot 3 (BITE) disabled for 4 turns
+        game = SimpleNamespace(rom=SimpleNamespace(effectiveness=lambda attack, defense: 1),
+                               u8=lambda name: memory.get(name, 7), owned=lambda dex: False)
+        state = dict(map="ROUTE_11", mode="battle", party=[dict(nickname="JEV", species="WARTORTLE", level=20, hp=30,
+                     max_hp=30, types=["WATER"], slot=0, moves=moves)], bag=[],
+                     battle=dict(kind="wild", player=player, enemy=enemy, active_slot=0, safari=False, moves=moves))
+        keys = [a.key for a in Controls(game).battle_actions(state)]
+        self.assertNotIn("move:2", keys)
+        self.assertIn("move:1", keys)
+        self.assertNotIn("struggle", keys)
+        moves[1]["pp"] = 0  # only the disabled move has PP left: FIGHT uses STRUGGLE
+        keys = [a.key for a in Controls(game).battle_actions(state)]
+        self.assertEqual([k for k in keys if k.startswith("move:")], [])
+        self.assertIn("struggle", keys)
+
+    def test_forget_move_menu_never_offers_an_hm(self):
+        # The game answers "HM techniques can't be deleted!" and reopens the same menu.
+        cells = [[" "] * 20 for _ in range(18)]
+        for y, text in ((8, "│▶ABSORB      │"), (10, "│ CUT         │"), (12, "│ POISONPOWDER│"), (14, "│ STUN SPORE  │"),
+                        (15, "Which move should"), (16, "be forgotten?")):
+            cells[y][4:4 + len(text)] = list(text)
+        screen = {"rows": ["".join(row) for row in cells], "cells": cells, "cursor": (5, 8), "waiting": False}
+        addrs = {"wTopMenuItemY": 8, "wTopMenuItemX": 5, "wMaxMenuItem": 3, "wOptions": 0x81}
+        game = SimpleNamespace(settle_screen=lambda: None, screen=lambda: screen, menu_ready=lambda: True,
+                               u8=lambda name: addrs[name], rom=SimpleNamespace(items={}), party=lambda: [])
+        labels = [a.target.get("label") for a in Controls(game).actions({"mode": "battle", "party": [], "bag": [],
+                                                                          "battle": {"player": {"hp": 30}}})]
+        self.assertEqual(labels, ["ABSORB", "POISONPOWDER", "STUN SPORE", None])  # None: B backs out to "Abandon learning?"
 
     def test_revive_search_does_not_land_on_max_revive(self):
         cells = [[" "] * 20 for _ in range(18)]

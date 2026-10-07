@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from pokemon_red_jev.goals import Goal, catch_reason, complete, team_plan
+from pokemon_red_jev.goals import Goal, catch_reason, complete, team_plan, wild_field_move_learners
 from pokemon_red_jev.regions import Regions
 from test_core import new_agent
 
@@ -40,6 +40,30 @@ class TeamBuildingChecks(unittest.TestCase):
         self.assertTrue(goal.done(state))
         self.assertIsNone(catch_reason(state, zubat))
         self.assertEqual(team_plan(state)['withdraw'], 0)
+
+    def test_cut_learner_is_wanted_even_when_far_below_the_team(self):
+        party = [dict(self.mon('WARTORTLE', 30, 'WATER'), learnable_hms=['HM03', 'HM04']),
+                 dict(self.mon('DIGLETT', 19, 'GROUND'), learnable_hms=[])]
+        oddish = dict(self.mon('ODDISH', 13, 'GRASS'), learnable_hms=['HM01'])
+        mankey = dict(self.mon('MANKEY', 10, 'FIGHTING'), learnable_hms=['HM04'])
+        state = dict(party=party, box=[], milestone={'id': 'surge'})
+        self.assertIsNone(catch_reason(state, oddish))
+        state['field_move_needed'] = 'CUT'
+        self.assertIn('HM01', catch_reason(state, oddish))
+        self.assertIsNone(catch_reason(state, mankey))
+
+    def test_planner_hears_which_nearby_wild_species_can_learn_cut(self):
+        maps = {1: {'name': 'ROUTE_6', 'wild': [{'species_id': 10, 'level': 16}, {'species_id': 11, 'level': 16},
+                                                {'species_id': 10, 'level': 13}]},
+                2: {'name': 'ROUTE_12', 'wild': [{'species_id': 10, 'level': 26}]}}
+        species = {10: {'name': 'ODDISH', 'learnable_hms': ['HM01']}, 11: {'name': 'MANKEY', 'learnable_hms': ['HM04']}}
+        party = [dict(self.mon('WARTORTLE', 30, 'WATER'), learnable_hms=['HM03', 'HM04'])]
+        state = dict(party=party, box=[], field_move_needed='CUT')
+        nearby = {'ROUTE_6', 'VERMILION_CITY'}
+        self.assertEqual(wild_field_move_learners(state, maps, species, nearby), {'ODDISH': ['ROUTE_6']})
+        state['box'] = [dict(self.mon('PARAS', 8, 'BUG'), learnable_hms=['HM01'])]
+        self.assertEqual(wild_field_move_learners(state, maps, species, nearby), {})  # withdraw it instead
+        self.assertEqual(wild_field_move_learners(dict(party=party), maps, species, nearby), {})
 
     def test_static_npc_block_is_not_misreported_as_cut(self):
         regions = Regions.__new__(Regions)

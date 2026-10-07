@@ -15,7 +15,7 @@ import zipfile
 
 from .controls import move_list_open, note_menu, party_unusable
 from .goals import (FOCUS_TTL, Goal, catch_reason, describe_situation, fallback_goal, focus_note,
-                    intent_key, intent_options, team_plan)
+                    intent_key, intent_options, team_plan, wild_field_move_learners)
 from .llm.context_builder import formatPartyForPrompt
 from .models import ModelError
 from .navigation import Action
@@ -101,6 +101,7 @@ class Agent:
         self.best_routes = {}
         self.team_attempts = {}
         self.catch_throws = {"key": None, "count": 0}
+        self.field_need = None
         self.team_errand = False
 
     @staticmethod
@@ -220,7 +221,9 @@ class Agent:
             self.navigation.update(state)
         report = getattr(self.navigation, "field_move_needed", None)
         if report and state.get("mode") == "overworld":
-            state["field_move_needed"] = report(state)
+            self.field_need = report(state)
+        # Battles keep the last overworld answer: the Cut learner is caught in battle.
+        state["field_move_needed"] = self.field_need
         memory = getattr(self.navigation, "memory", None)
         state["recent_dialog"] = list(getattr(memory, "dialog", []) or [])[-6:]
         rom = getattr(self.game, "rom", None)
@@ -419,6 +422,10 @@ class Agent:
                     del self.tried[key]
         key = intent_key(state)
         planned = self.goal.focus if (self.planner is not None or self.team_errand) and self.goal else None
+        if planned and planned not in options and self.goal == fallback_goal(state):
+            # The story fallback is blocked (say, progress needs Cut): let Jev pick an available focus within the
+            # fallback's budget. Ending it here asked the planner again at once, over and over.
+            planned = None
         if planned and (planned not in options or expired and held["value"] == planned):
             self.finish_goal("focus unavailable")
             self.intent = None
@@ -525,9 +532,14 @@ class Agent:
                  "bag": state.get("bag"), "milestone": kept,
                  "nearby_maps": state.get("map_distances") or {}, "visited": state.get("visited"),
                  "events": state.get("events") or [], "interactions": state.get("interactions") or [],
-                 "recent_actions": state.get("recent_actions")}
+                 "recent_actions": state.get("recent_actions"), "owned_count": len(self.owned_team(state))}
         if state.get("field_move_needed"):
             brief["field_move_needed"] = state["field_move_needed"]
+            rom = getattr(self.game, "rom", None)
+            learners = wild_field_move_learners(state, getattr(rom, "maps", None), getattr(rom, "species", None),
+                                                {state.get("map"), *(state.get("map_distances") or {})})
+            if learners:
+                brief["wild_field_move_learners"] = learners
         if state.get("recovery"):
             brief["recovery"] = state["recovery"]
         if state.get("situation"):
@@ -705,15 +717,20 @@ class Agent:
         if self.pending_item:
             state["using_item"] = self.pending_item["name"]
         self._show(state)
+        wanted = (catch_reason(state, (state.get("battle") or {}).get("enemy"),
+                               getattr(getattr(self.game, "rom", None), "effectiveness", None))
+                  and self.catch_throws["count"] < 5)
+        if state.get("battle"):
+            # Move facts and battle instructions warn against a knockout only when a ball will actually be offered.
+            # Otherwise "don't KO it" with no ball leaves only status moves, and Jev stalls with them while losing HP.
+            state["battle"]["catchable"] = bool(wanted) and any(
+                i["name"].endswith("BALL") and i["name"] != "MASTER BALL" and i.get("qty") for i in state.get("bag") or [])
         actions = self.navigation.actions(state, active) if state["mode"] == "overworld" else self.controls.actions(state)
         if not getattr(self.jev, "manual", False):
             # Never release, deposit a protected battler/HM user, or spend balls on unwanted duplicates.
-            wanted = catch_reason(state, (state.get("battle") or {}).get("enemy"),
-                                  getattr(self.game.rom, "effectiveness", None))
             actions = [a for a in actions if a.target.get("label") != "RELEASE"
                        and not (a.target.get("pc_mode") == "DEPOSIT" and a.target.get("pc_slot") in state["team_plan"]["keep"])
-                       and not (a.key.startswith("ball:") and (not wanted or self.catch_throws["count"] >= 5
-                                                              or a.target.get("name") == "MASTER BALL"))]
+                       and not (a.key.startswith("ball:") and (not wanted or a.target.get("name") == "MASTER BALL"))]
             enemy = (state.get("battle") or {}).get("enemy") or {}
             foe = [enemy.get("species"), enemy.get("level"), enemy.get("max_hp")]
             if state["mode"] == "overworld" or state["mode"] == "battle" and foe != self.benched["foe"]:

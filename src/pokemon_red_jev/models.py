@@ -90,9 +90,12 @@ def action_instructions(state):
                 "the incoming Pokémon takes a free hit first. "
                 "Poison and burn lose HP every turn, paralysis can skip a move, and sleep or freeze cannot act. "
                 "Avoid actions repeatedly attempted without progress.")
-    catching = state.get("current_focus") == "catch"
-    lead = ("The player's current focus is catching. A move that knocks the wild Pokémon out ends the catch. "
-            if catching else "")
+    lead = ""
+    if battle.get("catchable"):
+        lead = "This wild Pokémon is worth catching and a ball is available. A move that knocks it out ends the catch. "
+    elif state.get("current_focus") == "catch":
+        lead = ("No ball will be thrown at this wild Pokémon; it is not the catch target. "
+                "Escape or knock it out. Stalling with status moves only spends HP. ")
     if state.get("current_focus") == "train":
         lead = "The current focus is training. Win wild battles for experience; catching does not earn experience. "
     return lead + ("You are in a wild battle in Pokémon Red. Judge this turn from the escape chance, who moves first, "
@@ -195,6 +198,8 @@ previous_goal says what was just tried and how it ended. recent_actions are the 
 catalog.maps, catalog.events, catalog.items, and catalog.interactions are the only legal identifiers.
 target_map must be the current map or one of nearby_maps or a map named by the milestone.
 Prefer kind "map" for travel. Use the milestone's event or item only when that outcome happens on the target map.
+A catch goal ends only when a new Pokémon is caught: the code sets that success, so give any valid condition.
+state.wild_field_move_learners, when present, maps each wild species that can learn the missing field move to the nearby maps where it appears. To get that move, catch one of those species there; no other wild species can learn it.
 healed value is true; level is an integer 1-100 for any team member; badge is a badge number 1-8.
 Interaction means the NPC or sign was engaged, not that a quest succeeded.
 Never choose a condition already satisfied. A room is not finished just because the player is inside it.
@@ -221,6 +226,9 @@ def planned_goal(ask, state, catalog, previous, name, log):
         try:
             _reject_loop(raw, state, previous)
             goal = Goal.parse(raw, catalog)
+            if goal.focus == "catch" and type(state.get("owned_count")) is int:
+                # Only a new Pokémon finishes a catch. Map, level, or NPC proxies ended these errands before any catch.
+                goal.success = {"kind": "owned_count", "value": state["owned_count"] + 1}
             if goal.done(state):
                 raise ValueError("Goal is already complete in the current state")
             return goal, context

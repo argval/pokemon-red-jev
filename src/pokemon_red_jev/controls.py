@@ -118,6 +118,19 @@ NAMED_EFFECTS = {
 }
 
 
+STATS = ("Attack", "Defense", "Speed", "Special", "Accuracy", "Evasion")
+
+
+def stage_note(effect, u8):
+    """Stat stages run 1..13 (7 is neutral). A stat move at the limit does nothing; say so."""
+    for first, side, limit in ((0x12, "Enemy", 1), (0x3A, "Enemy", 1), (0x0A, "Player", 13), (0x32, "Player", 13)):
+        if first <= effect < first + 6:
+            stat = STATS[effect - first]
+            if u8(f"w{side}Mon{stat}Mod") == limit:
+                return f" {'Its' if side == 'Enemy' else 'Your'} {stat} can't go any further: using it again does nothing."
+    return ""
+
+
 def describe_effect(move):
     """What a move does beyond its printed power, in words a battle choice can use."""
     named = NAMED_EFFECTS.get(move.get("name"))
@@ -542,6 +555,8 @@ class Controls:
         for i, (label, index) in enumerate(labels):
             if label == "OPTION" and "NEW GAME" in rows:
                 continue
+            if label in FIELD_MOVES and "be forgotten?" in rows:
+                continue  # the game refuses to forget an HM and reopens this menu, so picking one loops forever
             facts = label
             if label == "NEW GAME":
                 facts = "Start a new game."
@@ -639,18 +654,19 @@ class Controls:
                      ("RUN", "Leave this Safari encounter.")]]
         accuracy_stage = evasion_stage = 7
         screens = 0
+        disabled = -1
         if hasattr(self.game, "u8"):
             accuracy_stage = self.game.u8("wPlayerMonAccuracyMod")
             evasion_stage = self.game.u8("wEnemyMonEvasionMod")
             screens = self.game.u8("wPlayerBattleStatus3")
-        catching = (state.get("current_focus") == "catch" or (state.get("active_goal") or {}).get("focus") == "catch")
-        balls_left = sum(item.get("qty", 0) for item in state.get("bag") or [] if str(item.get("name", "")).endswith("BALL"))
+            # High nibble is the disabled slot, 1-4. Picking it reopens the move menu without spending a turn,
+            # so the Disable never wears off and the same pick repeats forever.
+            disabled = (self.game.u8("wPlayerDisabledMove") >> 4) - 1
         incoming = self._threat(b["enemy"], b["player"])
         theirs = incoming[1::-1] if incoming else (0, 0)
         first = (b["player"].get("speed") or 0) > (b["enemy"].get("speed") or 0)
-        for move in b["moves"]:
-            if not move["pp"]:
-                continue
+        usable = [move for move in b["moves"] if move["pp"] and move["slot"] != disabled]
+        for move in usable:
             eff = self.game.rom.effectiveness(move["type"], b["enemy"]["types"])
             high = damage(b["player"], b["enemy"], move, eff)
             current_hit = hit_chance(move["accuracy"], accuracy_stage, evasion_stage)
@@ -670,7 +686,7 @@ class Controls:
             elif move["power"]:
                 low = high * 217 // 255
                 hp = b["enemy"]["hp"]
-                spoiled = " Knocks it out, so it can no longer be caught." if low >= hp and b["kind"] == "wild" and catching and balls_left else ""
+                spoiled = " Knocks it out, so it can no longer be caught." if low >= hp and b["kind"] == "wild" and b.get("catchable") else ""
                 effect = " Likely KO." if low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
                 desc += f" Rough damage {low}-{high}.{effect}{spoiled} Ignores critical hits and special effects. Enemy HP {hp}."
                 desc += race(b["player"]["hp"], hp, (low, high), theirs, first)
@@ -678,6 +694,8 @@ class Controls:
                 desc += " Status move (no direct damage)."
                 if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
                     desc += " Already in effect: using it again does nothing."
+                elif hasattr(self.game, "u8"):
+                    desc += stage_note(move.get("effect") or 0, self.game.u8)
             does = move.get("does") or describe_effect(move)
             if does and move["name"] not in special:
                 desc += " " + does
@@ -714,9 +732,9 @@ class Controls:
             options.append(Action("run", "Attempt to escape this wild battle.", "menu", target={"label": "RUN"}))
             if state["map"].startswith("POKEMON_TOWER_") and "SILPH SCOPE" not in {i["name"] for i in state["bag"]}:
                 return [Action("run", "Flee the unidentified ghost. Without the Silph Scope the party cannot fight it and it dodges balls.", "menu", target={"label": "RUN"})]
-        # Struggle depends on remaining PP. Switching, items, or running do not replace it.
-        if not any(move["pp"] for move in b["moves"]):
-            options.append(Action("struggle", "Fight with no PP remaining; the game uses STRUGGLE.", "menu", target={"label": "FIGHT"}))
+        # Struggle depends on remaining PP outside the disabled move. Switching, items, or running do not replace it.
+        if not usable:
+            options.append(Action("struggle", "Fight with no usable PP remaining; the game uses STRUGGLE.", "menu", target={"label": "FIGHT"}))
         outlook = self._outlook(state, b)
         if outlook:
             b["outlook"] = outlook

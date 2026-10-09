@@ -21,6 +21,10 @@ Automatic play reserves HP-restoring items for battles and necessary field recov
 
 Sleeping Snorlax on Routes 12 and 16 remains a collision obstacle in the route graph until its defeated/caught event is set, including when that map is not loaded. Planner and controller context identifies the blocker, Flute ownership, and the Silph Scope/Tower/Fuji prerequisites. Talking to Snorlax is omitted because it cannot clear the road. Without the Flute, automatic play near Snorlax takes a reachable exit; remembered dialog traps cannot suppress a physically open retreat there. With the Flute, the item action first walks to one of the ROM's permitted waking positions and then plays it to start the Lv30 encounter. A battle or map change during that approach interrupts item use.
 
+Battle choices use Red's move rules and current battle RAM types, HP, status, stat stages, and temporary effects. Automatic play omits moves that cannot work, such as PoisonPowder against Poison types or Stun Spore against an already paralyzed target. Manual control shows these moves with a reason. Ordinary damage multipliers do not describe status immunity. Estimates account for fixed damage, integer rounding, multiple hits, and Reflect/Light Screen; critical hits and conditional Counter/Bide damage remain uncertain.
+
+Each committed battle turn retains its result messages and observed effects until the next choice. PP expenditure, player damage, and changed screens do not count as useful effects. After three turns without a useful effect, automatic play prefers an available damaging move, a viable switch, or wild escape. Accuracy misses remain retryable. Turn memory survives checkpoints and resets when the opponent changes. If a trainer fight leaves only ineffective moves with PP, the player must spend that PP before the cartridge permits Struggle.
+
 ## Source map
 
 | File or directory | Responsibility |
@@ -34,6 +38,7 @@ Sleeping Snorlax on Routes 12 and 16 remains a collision obstacle in the route g
 | `src/pokemon_red_jev/goals.py`, `story.json` | Goal contract, observed completion, built-in story milestones, team reasoning. |
 | `src/pokemon_red_jev/navigation.py`, `regions.py` | Directed room/terrain routing, obstacles, warps, field actions, route memory. |
 | `src/pokemon_red_jev/controls.py` | Button drivers, menus, battle estimates and action facts. |
+| `src/pokemon_red_jev/battle.py`, `battle_memory.py` | Gen I move validity/damage rules and completed-turn feedback. |
 | `src/jev/` | Battle/team/training policy helpers. |
 | `src/state/`, `src/llm/`, package `state/` and `llm/` | Party/Pokédex helpers and planner context construction. |
 | `src/pokemon_red_jev/demo.py` | Offline scripted game and model stand-ins exercising the real Agent. |
@@ -64,6 +69,7 @@ These checks are headless and make no model requests. The opening test writes `s
 | Test file | Coverage |
 | --- | --- |
 | `test_core.py` | Goals, contexts, models, checkpoints, dashboard drawing, routing/menu/battle facts, and regressions. |
+| `test_battle.py`, `test_battle_state.py`, `test_battle_memory.py`, `test_battle_agent.py` | Gen I move rules, live battle facts, turn feedback, and recovery from repeated ineffective choices. |
 | `test_training.py`, `test_team_building.py` | Training progress/focus, grass pacing, catching and roster decisions. |
 | `test_recovery.py` | PC/shop cycles, cooldowns, boulder progress, route facts, checkpoint memory. |
 | `test_autonomy.py` | Routine vs model decisions, transient/permanent service failures, responsive retry pause; opt-in fresh opening through Oak without model calls. |

@@ -14,6 +14,8 @@ import time
 import zipfile
 
 from .controls import move_list_open, note_menu, party_unusable
+from .battle import damaging
+from .battle_memory import BattleMemory
 from .goals import (FOCUS_TTL, Goal, catch_reason, describe_situation, fallback_goal, focus_note,
                     intent_key, intent_options, team_plan, wild_field_move_learners)
 from .llm.context_builder import formatPartyForPrompt
@@ -78,6 +80,7 @@ class Agent:
         self.idle = 0
         # Party slots switched out against the current enemy Pokémon. Switching back only feeds it free hits.
         self.benched = {"foe": None, "slots": set()}
+        self.battle_memory = BattleMemory()
         self.best_distance = None
         self.completed_goals = 0
         self.plans = 0
@@ -115,6 +118,7 @@ class Agent:
 
     def _observe(self, state):
         """Observe changes even when a menu guard or a busy frame performed the action."""
+        self._observe_battle(state)
         if state["mode"] == "overworld":
             self.navigation.update(state)
         state["boulder_gains"] = getattr(getattr(self.navigation, "memory", None), "boulder_gains", 0)
@@ -142,6 +146,56 @@ class Agent:
             self.no_progress = 0
         self.observed = state
         return useful
+
+    def _observe_battle(self, state):
+        """Keep battle messages and effects until the next turn can be judged."""
+        screen = getattr(self.game, "screen", None)
+        dialog = screen().get("dialog", "") if state["mode"] == "battle" and callable(screen) else ""
+        outcome = self.battle_memory.observe(state, dialog)
+        if outcome:
+            self.log("battle_turn", **outcome)
+
+    def _battle_recovery(self, state, actions):
+        """After three fruitless turns, choose a legal attack or a viable retreat.
+        Missing an attack stays retryable; PP expenditure alone cannot clear the guard.
+        """
+        battle = state.get("battle")
+        context = self.battle_memory.context()
+        if not battle or context["stalled_turns"] < 3 or getattr(self.jev, "manual", False):
+            return None
+        balls = [a for a in actions if a.key.startswith("ball:")]
+        if battle.get("catchable") and balls:
+            return balls[0]
+        attacks = []
+        for action in actions:
+            estimate = action.target.get("damage_range")
+            if action.kind != "battle_move" or action.target.get("blocked_reason") or not estimate or not estimate[1]:
+                continue
+            if battle.get("catchable") and estimate[0] >= battle["enemy"].get("hp", 0):
+                continue
+            score = sum(estimate) * action.target.get("hit_percent", 100) / 200
+            score /= 1 + context["move_failures"].get(action.key, 0)
+            attacks.append((score, action))
+        if attacks:
+            return max(attacks, key=lambda item: item[0])[1]
+        switches = []
+        estimate_move = getattr(self.controls, "_estimate", None)
+        if callable(estimate_move):
+            for action in actions:
+                if action.kind != "switch":
+                    continue
+                mon = action.target
+                incoming = self.controls._threat(battle["enemy"], mon)
+                if incoming and incoming[0] >= mon.get("hp", 0):
+                    continue
+                estimates = [estimate_move(mon, battle["enemy"], m) for m in mon.get("moves") or []
+                             if damaging(m) and m.get("pp")]
+                best = max((e[1] for e in estimates if e is not None), default=0)
+                if best:
+                    switches.append((best, action))
+        if switches:
+            return max(switches, key=lambda item: item[0])[1]
+        return next((a for a in actions if a.key == "run"), None)
 
     def progress_key(self, state):
         result = {k: state.get(k) for k in ("events", "bag", "badges", "box", "visited")}
@@ -752,17 +806,30 @@ class Agent:
             # Otherwise "don't KO it" with no ball leaves only status moves, and Jev stalls with them while losing HP.
             state["battle"]["catchable"] = bool(wanted) and any(
                 i["name"].endswith("BALL") and i["name"] != "MASTER BALL" and i.get("qty") for i in state.get("bag") or [])
+        state["manual_control"] = bool(getattr(self.jev, "manual", False))
         actions = self.navigation.actions(state, active) if state["mode"] == "overworld" else self.controls.actions(state)
+        if state.get("battle"):
+            self._observe_battle(state)
+            if any(a.kind in {"battle_move", "switch", "battle_item"} or a.key in {"run", "struggle"} for a in actions):
+                outcome = self.battle_memory.finish(state)
+                if outcome:
+                    self.log("battle_turn", **outcome)
+            state["battle"]["turn_memory"] = self.battle_memory.context()
         if not getattr(self.jev, "manual", False):
             # Never release, deposit a protected battler/HM user, or spend balls on unwanted duplicates.
             actions = [a for a in actions if a.target.get("label") != "RELEASE"
                        and not (a.target.get("pc_mode") == "DEPOSIT" and a.target.get("pc_slot") in state["team_plan"]["keep"])
                        and not (a.key.startswith("ball:") and (not wanted or a.target.get("name") == "MASTER BALL"))]
             enemy = (state.get("battle") or {}).get("enemy") or {}
-            foe = [enemy.get("species"), enemy.get("level"), enemy.get("max_hp")]
+            foe = ((state.get("battle") or {}).get("enemy_id") or
+                   [enemy.get("species"), enemy.get("level"), enemy.get("max_hp")])
             if state["mode"] == "overworld" or state["mode"] == "battle" and foe != self.benched["foe"]:
                 self.benched = {"foe": foe, "slots": set()}
             actions = [a for a in actions if not (a.key.startswith("switch:") and a.target.get("slot") in self.benched["slots"])]
+            if state.get("battle") and not actions:
+                fallback = getattr(self.controls, "battle_fallback", None)
+                if callable(fallback):
+                    actions = fallback(state)
         if state["mode"] == "overworld":
             for action in actions:
                 action.description = focus_note(state["current_focus"], action.description)
@@ -790,7 +857,10 @@ class Agent:
                                            if (count := self.failures.get(location + ':' + a.key, 0)) else "")
                    for a in actions}
         resumed = self._take_resume(state, actions)
-        routine = None if resumed else self._routine_action(state, actions)
+        recovery = self._battle_recovery(state, actions)
+        routine = None if resumed else recovery or self._routine_action(state, actions)
+        if recovery:
+            self.log("guard", reason="three battle turns without useful effect", choice=recovery.key)
         if resumed:
             choice = resumed.key
             self.log("resume", map=state["map"], choice=choice, tries=self.resume_walk["tries"])
@@ -815,6 +885,8 @@ class Agent:
             self.jev.last = {**last, "purpose": state["mode"], "picked": choice}
             self._show(state)
         action = next(a for a in actions if a.key == choice)
+        if state.get("battle"):
+            self.battle_memory.start(action, state["battle"])
         if choice.startswith("ball:"):
             self.catch_throws["count"] += 1
         if choice.startswith("switch:"):
@@ -930,6 +1002,7 @@ class Agent:
         memory = {"version": 1, "visited": sorted(self.game.visited), "interactions": sorted(self.game.interactions),
                   "outside_map": self.game.outside_map, "last_map": self.game.last_map, "frames": self.game.frames,
                   "history": self.history, "failures": self.failures,
+                  "battle_memory": self.battle_memory.to_dict(),
                   "losses": self.losses, "wiped_now": self.wiped_now, "pending_item": self.pending_item,
                   "intent": self.intent, "shop_money": self.shop_money, "shop_at": self.shop_at,
                   "pc_session": self.pc_session, "pc_done": self.pc_done,
@@ -971,6 +1044,7 @@ class Agent:
         self.game.outside_map, self.game.last_map = memory["outside_map"], memory["last_map"]
         self.game.frames = memory["frames"]
         self.history, self.failures = memory["history"], memory["failures"]
+        self.battle_memory.load(memory.get("battle_memory"))
         self.losses = memory.get("losses", {})
         self.wiped_now = memory.get("wiped_now", False)
         self.intent = memory.get("intent")

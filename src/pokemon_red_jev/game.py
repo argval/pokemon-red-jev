@@ -350,6 +350,14 @@ class Game:
     def u8(self, name, offset=0):
         return self.memory[self.data.sym(name) + offset]
 
+    def _optional_u8(self, name, default=0):
+        """Read added battle facts without requiring a newer generated symbol set."""
+        try:
+            value = self.u8(name)
+        except (KeyError, AttributeError, TypeError, IndexError):
+            return default
+        return value if isinstance(value, int) and 0 <= value <= 255 else default
+
     def be16(self, addr):
         return self.memory[addr] << 8 | self.memory[addr + 1]
 
@@ -445,16 +453,40 @@ class Game:
                 if i not in hidden and self.u8("wSpriteStateData1", i * 16)]
 
     def battle(self):
-        def mon(name):
+        """Observe current stats, types, temporary effects, and enemy identity.
+        Recharge is explicit because Red's sleep effect can replace a status during recharge.
+        """
+        def mon(name, side):
+            """Read this combatant's battle struct and current effects from Red WRAM."""
             a = self.data.sym(name)
             sp = self.rom.species.get(self.memory[a], {})
-            return dict(species=sp.get("name", "?"), types=sp.get("types", []), level=self.memory[a + 14],
+            flags = [self._optional_u8(f"w{side}BattleStatus{i}") for i in range(1, 4)]
+            volatile: dict[str, bool | int] = {key: bool(flags[byte - 1] & (1 << bit)) for key, byte, bit in (
+                ("charging", 1, 4), ("invulnerable", 1, 6), ("confused", 1, 7),
+                ("x_accuracy", 2, 0), ("mist", 2, 1), ("focus_energy", 2, 2),
+                ("substitute", 2, 4), ("recharge", 2, 5), ("seeded", 2, 7),
+                ("badly_poisoned", 3, 0), ("light_screen", 3, 1), ("reflect", 3, 2), ("transformed", 3, 3))}
+            volatile["substitute_hp"] = self._optional_u8(f"w{side}SubstituteHP") if volatile["substitute"] else 0
+            stages = {}
+            for stat in ("Attack", "Defense", "Speed", "Special", "Accuracy", "Evasion"):
+                value = self._optional_u8(f"w{side}Mon{stat}Mod", 7)
+                stages[stat.lower()] = value if 1 <= value <= 13 else 7
+            types = list(dict.fromkeys(TYPES.get(self.memory[a + offset], "?") for offset in (5, 6)))
+            return dict(species=sp.get("name", "?"), species_id=self.memory[a], types=types, level=self.memory[a + 14],
                         hp=self.be16(a + 1), max_hp=self.be16(a + 15), status=status(self.memory[a + 4]),
                         attack=self.be16(a + 17), defense=self.be16(a + 19), speed=self.be16(a + 21), special=self.be16(a + 23),
                         catch_rate=sp.get("catch_rate", 0), dex=sp.get("dex", 0), learnable_hms=hm_names(sp),
-                        moves=self.moves_at(a + 8, a + 25))
-        player, enemy = mon("wBattleMon"), mon("wEnemyMon")
-        return dict(kind="wild" if self.u8("wIsInBattle") == 1 else "trainer", player=player, enemy=enemy,
+                        moves=self.moves_at(a + 8, a + 25), volatile=volatile, stat_stages=stages)
+        player, enemy = mon("wBattleMon", "Player"), mon("wEnemyMon", "Enemy")
+        kind = "wild" if self.u8("wIsInBattle") == 1 else "trainer"
+        slot = self._optional_u8("wEnemyMonPartyPos", self.memory[self.data.sym("wEnemyMon") + 3])
+        enemy["party_slot"] = slot if kind == "trainer" and slot < 6 else None
+        original_species = self._optional_u8("wEnemyMonSpecies2", enemy["species_id"])
+        if original_species not in self.rom.species:
+            original_species = enemy["species_id"]
+        enemy_id = ([kind, enemy["party_slot"]] if enemy["party_slot"] is not None else
+                    [kind, None, original_species, enemy["level"], enemy["max_hp"]])
+        return dict(kind=kind, player=player, enemy=enemy, enemy_id=enemy_id,
                     active_slot=self.u8("wPlayerMonNumber"), moves=player["moves"],
                     safari=self.u8("wBattleType") == 2, safari_balls=self.u8("wNumSafariBalls"))
 

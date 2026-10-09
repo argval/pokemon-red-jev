@@ -82,11 +82,15 @@ def action_instructions(state):
             "or an item the story milestone still needs. "
             "Use the route and battle facts. Avoid actions repeatedly attempted without progress.", state)
     battle = state.get("battle") or {}
+    battle_rules = ("battle.outlook summarizes the opponent's current types, HP, status and stats. "
+                    "battle.turn_memory records completed turns and their effects; spending PP is not progress. "
+                    "Use the supplied Red move rules: ordinary damage matchups do not determine status immunity. "
+                    "Do not repeat a status the target already has. An accuracy miss can be retried. ")
     if battle.get("safari"):
         return ("You are in a Safari Zone battle. Choose among the ball, bait, rock, and run using the catch facts. "
                 "A new species is worth a ball. Leave when balls are scarce or the catch chance is poor.")
     if battle.get("kind") == "trainer":
-        return ("You are in a trainer battle in Pokémon Red. Running is impossible. "
+        return battle_rules + ("You are in a trainer battle in Pokémon Red. Running is impossible. "
                 "Choose the move, switch, or item that wins the fight and keeps the party alive. "
                 "Every option lists type, power, PP, accuracy, what the move does, a damage estimate, and the enemy's moves. "
                 "Each move's facts say who likely faints first. Prefer a move that wins that exchange. "
@@ -102,7 +106,7 @@ def action_instructions(state):
                 "Escape or knock it out. Stalling with status moves only spends HP. ")
     if state.get("current_focus") == "train":
         lead = "The current focus is training. Win wild battles for experience; catching does not earn experience. "
-    return lead + ("You are in a wild battle in Pokémon Red. Judge this turn from the escape chance, who moves first, "
+    return battle_rules + lead + ("You are in a wild battle in Pokémon Red. Judge this turn from the escape chance, who moves first, "
                    "the enemy's moves, your moves, and the ball facts. Switch options list that Pokémon's moves the same way. "
                    "Each move's facts say who likely faints first; a switch gives the enemy a free hit on the incoming Pokémon. "
                    "active_goal is why you are on this route. Escape when the escape is likely and the fight would spend HP the party cannot spare. "

@@ -2,11 +2,11 @@
 
 import re
 
+from .battle import FIXED, CONDITIONAL, damage, damage_range, damaging, move_failure, move_name, switch_stats
 from .goals import next_gym
 from .healing import HEAL, field_heal_allowed
 from .navigation import FLY_TOWNS, Action
 
-PHYSICAL = {"NORMAL", "FIGHTING", "FLYING", "POISON", "GROUND", "ROCK", "BUG", "GHOST"}
 # Gen 1 stat-stage ratios, stage 1..13. Stage 7 is unchanged.
 STAGE = [(25, 100), (28, 100), (33, 100), (40, 100), (50, 100), (66, 100), (1, 1),
          (15, 10), (2, 1), (25, 10), (3, 1), (35, 10), (4, 1)]
@@ -76,13 +76,13 @@ EFFECTS = {
     0x18: "User becomes the type of one of its moves.", 0x19: "Resets every stat change.",
     0x1A: "Waits 2–3 turns, then returns twice the damage taken.",
     0x1B: "Attacks for 2–3 turns, then confuses the user.",
-    0x1C: "Ends a wild battle. Against a trainer, it switches their Pokémon.",
-    0x1D: "Hits 2–5 times. A damage estimate is for one hit.", 0x1F: "May cause flinching.",
+    0x1C: "Can end a wild battle. Fails against a trainer.",
+    0x1D: "Hits 2–5 times.", 0x1F: "May cause flinching.",
     0x20: "Puts the target to sleep.", 0x21: "May poison.", 0x22: "May burn.", 0x24: "May paralyze.",
     0x25: "May cause flinching.", 0x26: "One-hit KO. Fails against a faster target. Low accuracy.",
     0x27: "Charges on the first turn, then hits.", 0x28: "Removes half the target's remaining HP.",
     0x29: "Deals fixed or level-based damage.", 0x2A: "Traps the target for 2–5 turns so it cannot run or switch.",
-    0x2B: "Vanishes for a turn, then hits.", 0x2C: "Hits twice. A damage estimate is for one hit.",
+    0x2B: "Vanishes for a turn, then hits.", 0x2C: "Hits twice.",
     0x2D: "If it misses, the user is hurt.", 0x2E: "Blocks stat drops while it lasts.",
     0x2F: "Lowers the user's critical-hit rate in this game.", 0x30: "The user takes recoil.",
     0x31: "Confuses the target.", 0x32: "Sharply raises the user's Attack.", 0x33: "Sharply raises the user's Defense.",
@@ -97,7 +97,7 @@ EFFECTS = {
     0x42: "Poisons the target.", 0x43: "Paralyzes the target.",
     0x44: "May lower the target's Attack.", 0x45: "May lower the target's Defense.",
     0x46: "May lower the target's Speed.", 0x47: "May lower the target's Special.",
-    0x4C: "May confuse.", 0x4D: "Hits twice and may poison. A damage estimate is for one hit.",
+    0x4C: "May confuse.", 0x4D: "Hits twice and may poison.",
     0x4F: "Spends a quarter of max HP to put up a substitute.",
     0x50: "The user recharges next turn if it hits.",
     0x51: "Attack rises when hit, and the user keeps using it.",
@@ -356,16 +356,6 @@ def pc_summary(state):
     return text
 
 
-def damage(player, enemy, move, effectiveness):
-    if not move["power"] or not effectiveness:
-        return 0
-    physical = move["type"] in PHYSICAL
-    attack = player["attack"] if physical else player["special"]
-    defense = enemy["defense"] if physical else enemy["special"]
-    base = ((2 * player["level"] // 5 + 2) * move["power"] * attack // max(1, defense)) // 50 + 2
-    return int(base * (1.5 if move["type"] in player["types"] else 1) * effectiveness)
-
-
 def race(hp, enemy_hp, mine, theirs, first):
     """Who faints first if both sides repeat their best hit. mine/theirs are (low, high) damage.
 
@@ -376,7 +366,7 @@ def race(hp, enemy_hp, mine, theirs, first):
     if need is None:
         return ""
     if survive is None:
-        return f" Knocks it out in about {need} hit(s) and it cannot hurt you: you win this exchange."
+        return f" Knocks it out in about {need} hit(s); the enemy has no known direct damage."
     wins = need < survive or (need == survive and first)
     return (f" Knocks it out in about {need} hit(s); its best attack knocks you out in about {survive}, "
             f"and {'you move' if first else 'it moves'} first: "
@@ -515,6 +505,11 @@ class Controls:
     def actions(self, state):
         g = self.game
         g.settle_screen()
+        if state["mode"] == "battle" and callable(getattr(g, "snapshot", None)):
+            catchable = (state.get("battle") or {}).get("catchable", False)
+            state.update(g.snapshot())
+            if state.get("battle"):
+                state["battle"]["catchable"] = catchable
         screen = g.screen()
         state["screen"] = screen["rows"]
         rows = " ".join(screen["rows"])
@@ -640,6 +635,9 @@ class Controls:
     def battle_actions(self, state):
         b = state["battle"]
         options = []
+        blocked = []
+        b["move_facts"], b["unavailable_moves"] = [], []
+        b.pop("fallback_move", None)
         if b.get("safari"):
             enemy = b.get("enemy") or {}
             rate = enemy.get("catch_rate", 0)
@@ -665,33 +663,40 @@ class Controls:
             # so the Disable never wears off and the same pick repeats forever.
             disabled = (self.game.u8("wPlayerDisabledMove") >> 4) - 1
         incoming = self._threat(b["enemy"], b["player"])
+        uncertain = self._uncertain_threat(b["enemy"], b["player"])
         theirs = incoming[1::-1] if incoming else (0, 0)
         first = (b["player"].get("speed") or 0) > (b["enemy"].get("speed") or 0)
         usable = [move for move in b["moves"] if move["pp"] and move["slot"] != disabled]
         for move in usable:
             eff = self.game.rom.effectiveness(move["type"], b["enemy"]["types"])
-            high = damage(b["player"], b["enemy"], move, eff)
+            estimate = self._estimate(b["player"], b["enemy"], move)
+            reason = move_failure(move, b["player"], b["enemy"], b["kind"])
+            if not reason and damaging(move) and estimate == (0, 0):
+                reason = "This attack cannot damage the target with its current types and stats."
             current_hit = hit_chance(move["accuracy"], accuracy_stage, evasion_stage)
+            if ((b["player"].get("volatile") or {}).get("x_accuracy") or move.get("effect") == 0x11
+                    or move.get("effect") == 0x20 and (b["enemy"].get("volatile") or {}).get("recharge")):
+                current_hit = 100
             hit_note = f" Hit chance right now about {current_hit}%." if current_hit not in (None, move["accuracy"]) else ""
-            desc = f"Use {move['name']}: {move['type']}, power {move['power']}, PP {move['pp']}, accuracy {move['accuracy']}%, type multiplier {eff}.{hit_note}"
-            # Special effects don't follow the ordinary power formula.
-            special = {"SEISMIC TOSS": f"Level-based damage: {b['player']['level']} HP.",
-                       "NIGHT SHADE": f"Level-based damage: {b['player']['level']} HP.",
-                       "SONIC BOOM": "Fixed damage: 20 HP.", "DRAGON RAGE": "Fixed damage: 40 HP.",
-                       "SUPER FANG": "Removes half the enemy's remaining HP.",
-                       "PSYWAVE": "Random damage up to 1.5 times your level.",
-                       "BIDE": "Waits 2–3 turns, then returns twice the damage taken.",
-                       "COUNTER": "Returns twice the NORMAL/FIGHTING damage taken this turn; otherwise fails.",
-                       **{m: "One-hit KO; fails against faster enemies. Low accuracy." for m in ("FISSURE", "HORN DRILL", "GUILLOTINE")}}
-            if move["name"] in special:
-                desc += " " + special[move["name"]] + " Ordinary damage estimate does not apply."
-            elif move["power"]:
-                low = high * 217 // 255
+            desc = f"Use {move['name']}: {move['type']}, power {move['power']}, PP {move['pp']}, accuracy {move['accuracy']}%.{hit_note}"
+            if damaging(move):
+                if move_name(move) not in FIXED | CONDITIONAL:
+                    desc += f" Damage type multiplier {eff}."
+                else:
+                    desc += " Red's special damage rules apply instead of the ordinary type multiplier."
+            if damaging(move) and estimate is not None:
+                low, high = estimate
                 hp = b["enemy"]["hp"]
                 spoiled = " Knocks it out, so it can no longer be caught." if low >= hp and b["kind"] == "wild" and b.get("catchable") else ""
                 effect = " Likely KO." if low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
-                desc += f" Rough damage {low}-{high}.{effect}{spoiled} Ignores critical hits and special effects. Enemy HP {hp}."
-                desc += race(b["player"]["hp"], hp, (low, high), theirs, first)
+                desc += f" Rough damage {low}-{high} on a hit.{effect}{spoiled} Ignores critical hits. Enemy HP {hp}."
+                if uncertain:
+                    desc += " Enemy conditional damage makes the exchange uncertain."
+                elif move.get("effect") not in {0x26, 0x27, 0x2B, 0x50} and move_name(move) != "SUPERFANG":
+                    moves_first = True if move_name(move) == "QUICKATTACK" else first
+                    desc += race(b["player"]["hp"], hp, estimate, theirs, moves_first)
+            elif damaging(move):
+                desc += " Damage depends on the moves and damage taken during the turn."
             else:
                 desc += " Status move (no direct damage)."
                 if screens & {"REFLECT": 4, "LIGHT SCREEN": 2}.get(move["name"], 0):
@@ -699,12 +704,21 @@ class Controls:
                 elif hasattr(self.game, "u8"):
                     desc += stage_note(move.get("effect") or 0, self.game.u8)
             does = move.get("does") or describe_effect(move)
-            if does and move["name"] not in special:
+            if does:
                 desc += " " + does
-            options.append(Action(f"move:{move['slot']}", desc, "battle_move", target=move))
+            if reason:
+                desc += f" Cannot work now: {reason}"
+                b["unavailable_moves"].append({"slot": move["slot"], "name": move["name"], "reason": reason})
+            hit = current_hit or move["accuracy"]
+            b["move_facts"].append({"slot": move["slot"], "name": move["name"], "damage_range": estimate,
+                                    "hit_percent": hit, "blocked_reason": reason})
+            action = Action(f"move:{move['slot']}", desc, "battle_move",
+                            target={**move, "damage_range": estimate, "hit_percent": hit, "blocked_reason": reason})
+            (blocked if reason and not state.get("manual_control") else options).append(action)
         for p in state["party"]:
             if p["hp"] and p["slot"] != b["active_slot"]:
-                attacks = [m for m in p["moves"] if m["power"] and m["pp"]]
+                p = switch_stats(p)
+                attacks = [m for m in p["moves"] if damaging(m) and m["pp"]]
                 best = max((self.game.rom.effectiveness(m["type"], b["enemy"]["types"]) for m in attacks), default=None)
                 threat = max((self.game.rom.effectiveness(t, p["types"]) for t in b["enemy"]["types"]), default=1)
                 listed = self._bench_moves(p, b["enemy"])
@@ -737,12 +751,35 @@ class Controls:
         # Struggle depends on remaining PP outside the disabled move. Switching, items, or running do not replace it.
         if not usable:
             options.append(Action("struggle", "Fight with no usable PP remaining; the game uses STRUGGLE.", "menu", target={"label": "FIGHT"}))
+        if blocked:
+            b["fallback_move"] = {"key": blocked[0].key, "description": blocked[0].description,
+                                  "target": blocked[0].target}
+        if not options:
+            options.extend(self.battle_fallback(state))
         outlook = self._outlook(state, b)
         if outlook:
             b["outlook"] = outlook
             for option in options:
                 option.description += " " + outlook
         return options
+
+    def battle_fallback(self, state):
+        """Keep a legal last resort if later automatic filters remove every alternative."""
+        fallback = (state.get("battle") or {}).get("fallback_move")
+        if not fallback:
+            return []
+        text = fallback["description"] + " No useful alternative remains. Spend this PP until the game permits Struggle."
+        return [Action(fallback["key"], text, "battle_move", target=fallback["target"])]
+
+    def _estimate(self, attacker, defender, move):
+        """Apply the ROM's type entries in order, preserving Red's integer rounding."""
+        rom = self.game.rom
+        chart = getattr(rom, "type_chart", None)
+        multipliers = ([value for (attack, defense), value in chart.items()
+                        if attack == move.get("type") and defense in defender.get("types", [])]
+                       if isinstance(chart, dict) else None)
+        return damage_range(attacker, defender, move,
+                            rom.effectiveness(move.get("type"), defender.get("types") or []), multipliers=multipliers)
 
     def _byte(self, name):
         if not hasattr(self.game, "u8"):
@@ -764,16 +801,20 @@ class Controls:
 
     def _move_detail(self, attacker, defender, move):
         does = move.get("does") or describe_effect(move)
-        if not move.get("power"):
+        reason = move_failure(move, attacker, defender)
+        if reason:
+            return f"{move['name']}: cannot work now. {reason}"
+        if not damaging(move):
             text = f"{move['name']}: {move.get('type', '?')}, PP {move.get('pp')}, no direct damage."
             return f"{text} {does}".strip()
         eff = self.game.rom.effectiveness(move["type"], defender.get("types") or [])
         text = (f"{move['name']}: {move.get('type', '?')}, power {move['power']}, PP {move.get('pp')}, "
-                f"accuracy {move.get('accuracy')}%, type multiplier {eff}.")
-        stat = "attack" if move.get("type") in PHYSICAL else "special"
-        if attacker.get(stat):
-            high = damage(attacker, defender, move, eff)
-            low = high * 217 // 255
+                f"accuracy {move.get('accuracy')}%.")
+        text += (" Red's special damage rules ignore ordinary type multipliers."
+                 if move_name(move) in FIXED | CONDITIONAL else f" Damage type multiplier {eff}.")
+        estimate = self._estimate(attacker, defender, move)
+        if estimate is not None:
+            low, high = estimate
             hp = defender.get("hp")
             effect = " Likely KO." if hp and low >= hp else " High damage." if hp and round(high / hp * 100) > 50 else ""
             text += f" Rough damage {low}-{high}.{effect}"
@@ -798,37 +839,44 @@ class Controls:
         """The enemy's hardest known hit on defender, as (high, low, move name), or None."""
         best = None
         for move in enemy.get("moves") or []:
-            if not move.get("power") or not move.get("pp", 1):
+            if not damaging(move) or not move.get("pp", 1):
                 continue
-            stat = "attack" if move.get("type") in PHYSICAL else "special"
-            if not enemy.get(stat):
+            estimate = self._estimate(enemy, defender, move)
+            if estimate is None:
                 continue
-            eff = self.game.rom.effectiveness(move["type"], defender.get("types") or [])
-            high = damage(enemy, defender, move, eff)
+            low, high = estimate
             if best is None or high > best[0]:
-                best = (high, high * 217 // 255, move["name"])
+                best = (high, low, move["name"])
         return best
+
+    def _uncertain_threat(self, enemy, defender):
+        """Unknown Counter/Bide damage cannot be treated as a harmless enemy turn."""
+        return any(damaging(move) and move.get("pp", 1) and self._estimate(enemy, defender, move) is None
+                   for move in enemy.get("moves") or [])
 
     def _switch_cost(self, mon, enemy):
         """Switching hands the enemy a free hit on the incoming Pokémon. Then its best move races the enemy."""
         hit = self._threat(enemy, mon)
+        uncertain = self._uncertain_threat(enemy, mon)
         if not hit:
-            return ""
+            return " Enemy conditional damage makes the switch-in risk uncertain." if uncertain else ""
         text = f" The enemy gets a free hit as it comes in: its {hit[2]} does about {hit[1]}-{hit[0]} of its {mon['hp']} HP"
         if hit[1] >= mon["hp"]:
             return text + ", enough to knock it out before it acts."
+        if uncertain:
+            return text + ". Counter or Bide may change this damage; the exchange is uncertain."
         best = None
         if mon.get("attack") and mon.get("special"):
             for move in mon.get("moves") or []:
-                if move.get("power") and move.get("pp"):
-                    high = damage(mon, enemy, move, self.game.rom.effectiveness(move["type"], enemy.get("types") or []))
-                    if best is None or high > best[0]:
-                        best = (high, move["name"])
+                if damaging(move) and move.get("pp"):
+                    estimate = self._estimate(mon, enemy, move)
+                    if estimate is not None and (best is None or estimate[1] > best[0]):
+                        best = (estimate[1], move["name"], estimate)
         if not best:
             return text + "."
         left = max(1, mon["hp"] - (hit[0] + hit[1]) // 2)
         first = (mon.get("speed") or 0) > (enemy.get("speed") or 0)
-        return text + f". Then with {best[1]}:" + race(left, enemy.get("hp", 0), (best[0] * 217 // 255, best[0]), hit[1::-1], first)
+        return text + f". Then with {best[1]}:" + race(left, enemy.get("hp", 0), best[2], hit[1::-1], first)
 
     def _incoming(self, battle):
         player = battle["player"]
@@ -845,7 +893,10 @@ class Controls:
 
     def _outlook(self, state, battle):
         player, enemy = battle["player"], battle["enemy"]
-        parts = []
+        parts = [f"Enemy {enemy.get('species', '?')} Lv{enemy.get('level', '?')}, {'/'.join(enemy.get('types') or [])}, "
+                 f"HP {enemy.get('hp', '?')}/{enemy.get('max_hp', '?')}, status {enemy.get('status', 'OK')}. "
+                 f"Attack {enemy.get('attack', '?')}, Defense {enemy.get('defense', '?')}, "
+                 f"Special {enemy.get('special', '?')}, Speed {enemy.get('speed', '?')}."]
         p_speed, e_speed = player.get("speed"), enemy.get("speed")
         if isinstance(p_speed, int) and isinstance(e_speed, int):
             if p_speed > e_speed:
@@ -854,6 +905,7 @@ class Controls:
                 parts.append(f"The enemy acts first (speed {e_speed} vs {p_speed}).")
             else:
                 parts.append(f"Speed is tied at {p_speed}; either side may move first.")
+            parts.append("Priority moves can change this order.")
             if battle.get("kind") == "wild":
                 attempts = self._byte("wNumRunAttempts") or 0
                 chance = escape_chance(p_speed, e_speed, attempts)
